@@ -1,0 +1,14 @@
+# Manual player id overrides. Keyed by nba_player_id (as a string).
+# These ALWAYS win over fuzzy matching and are never overwritten by a
+# rebuild. Add an entry whenever `nbare xwalk-unresolved` surfaces a
+# player you care about.
+#
+# 2544:
+#   bbref_slug: jamesle01
+#   spotrac_slug: lebron-james
+#   note: sanity-check entry
+
+203999:
+  bbref_slug: jokicni01
+  spotrac_slug: nikola-jokic
+  note: diacritics in source name

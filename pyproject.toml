@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nbare"
+version = "0.1.0"
+description = "NBA roster construction engine: CBA rule engine, RAPM, projections, MILP optimizer"
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.0",
+    "polars>=1.0",
+    "pyarrow>=15",
+    "pydantic>=2.6",
+    "nba_api>=1.11",
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+model = ["numpy>=1.26", "scipy>=1.12", "scikit-learn>=1.4", "numpyro>=0.15", "arviz>=0.18"]
+opt = ["highspy>=1.7", "pulp>=2.8"]
+scrape = ["selectolax>=0.3", "beautifulsoup4>=4.12"]
+dev = ["pytest>=8.0", "hypothesis>=6.100", "ruff>=0.4", "mypy>=1.10"]
+
+[project.scripts]
+nbare = "nbare.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nbare = ["warehouse/*.sql", "crosswalk/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --doctest-modules --ignore=src/nbare/ingest/nba_stats.py"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
