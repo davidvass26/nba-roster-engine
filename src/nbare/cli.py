@@ -166,15 +166,237 @@ def build_xwalk_cmd(
     console.print(f"[yellow]unresolved: {miss.height:,} (see overrides.yaml)")
 
 
+@app.command("check-trade")
+def check_trade_cmd(
+    contracts: str = typer.Argument(..., help="BBRef contract CSV"),
+    send: str = typer.Option(..., help="outgoing bbref slug, e.g. reaveau01"),
+    receive: str = typer.Option(..., help="incoming bbref slug, e.g. vassede01"),
+    season: str = typer.Option(CURRENT_SEASON),
+) -> None:
+    """Check salary-matching legality of a two-player swap between the
+    teams the two players currently play for.
+
+    This exercises the full Stage 1 path on real data: it builds each
+    team's cap sheet from the contract file, constructs the trade, and
+    prints a per-team verdict with the specific CBA band cited. Verdicts
+    can be LEGAL, ILLEGAL, or INDETERMINATE -- the last is not a failure,
+    it means a fact we cannot observe (incentives, cap room) could change
+    the answer, and the engine declines to guess.
+    """
+    import polars as pl
+
+    from nbare.cba.matching import Severity, check_trade
+    from nbare.config import league_year
+    from nbare.domain.models import (
+        CapSheet, PlayerSalary, TradePiece, TradeProposal,
+    )
+    from nbare.domain.money import Money
+    from nbare.ingest.contracts import load_raw, to_contract_years
+
+    ly = league_year(season)
+    years = to_contract_years(load_raw(contracts)).filter(
+        pl.col("season") == season
+    )
+
+    def one(slug: str) -> dict:
+        rows = years.filter(pl.col("bbref_slug") == slug).to_dicts()
+        if not rows:
+            raise typer.BadParameter(f"slug {slug!r} not found for {season}")
+        return rows[0]
+
+    def cap_sheet(team: str) -> CapSheet:
+        rs = years.filter(pl.col("team_abbrev") == team).to_dicts()
+        sal = tuple(
+            PlayerSalary(
+                player_id=r["bbref_slug"], name=r["player"],
+                cap_hit=Money(r["cap_hit"]), guaranteed=Money(r["guaranteed"]),
+                is_dead_money=bool(r["needs_review"]),
+            )
+            for r in rs
+        )
+        certain = not any(s.is_dead_money for s in sal)
+        return CapSheet(
+            team=team, season=season, salaries=sal, certain=certain,
+            uncertainty_notes=(
+                ("cap sheet contains rows flagged for review (dead money)",)
+                if not certain else ()
+            ),
+        )
+
+    a, b = one(send), one(receive)
+    ta, tb = a["team_abbrev"], b["team_abbrev"]
+
+    def to_ps(r: dict) -> PlayerSalary:
+        return PlayerSalary(
+            player_id=r["bbref_slug"], name=r["player"],
+            cap_hit=Money(r["cap_hit"]), guaranteed=Money(r["guaranteed"]),
+        )
+
+    prop = TradeProposal(pieces=(
+        TradePiece(to_ps(a), ta, tb),
+        TradePiece(to_ps(b), tb, ta),
+    ))
+    report = check_trade({ta: cap_sheet(ta), tb: cap_sheet(tb)}, prop, ly)
+
+    console.print(
+        f"\n[bold]{a['player']}[/bold] ({ta}, ${a['cap_hit']:,})  <-->  "
+        f"[bold]{b['player']}[/bold] ({tb}, ${b['cap_hit']:,})\n"
+    )
+    color = {
+        Severity.LEGAL: "green",
+        Severity.ILLEGAL: "red",
+        Severity.INDETERMINATE: "yellow",
+    }
+    console.print(
+        f"OVERALL: [{color[report.severity]}]"
+        f"{report.severity.value.upper()}[/]\n"
+    )
+    for v in report.verdicts:
+        console.print(f"[{color[v.severity]}]{v.team}: {v.severity.value.upper()}[/]"
+                      f"  [{v.band}]")
+        console.print(f"  {v.reason}")
+        console.print(f"  [dim]rule: {v.rule}[/dim]")
+        for c in v.caveats:
+            console.print(f"  [yellow]caveat:[/yellow] {c}")
+        console.print()
+
+
+@app.command("apply-overrides")
+def apply_overrides_cmd(
+    contracts: str = typer.Argument(..., help="base BBRef contract CSV"),
+    overlay: str = typer.Argument(..., help="transaction overlay YAML"),
+    season: str = typer.Option(CURRENT_SEASON),
+    team: str = typer.Option(None, help="show only this team's roster after"),
+) -> None:
+    """Apply a transaction overlay (signings, waives, trades) on top of the
+    base contract snapshot and show the result.
+
+    The base CSV is never modified. The overlay is an ordered, diffable
+    transaction log; anything suspicious (waiving a player who isn't on the
+    named team, amending a row that doesn't exist) is reported as a warning
+    rather than silently applied.
+    """
+    import polars as pl
+
+    from nbare.config import league_year
+    from nbare.ingest.contracts import load_raw, to_contract_years
+    from nbare.ingest.transactions import apply_transactions, load_transactions
+
+    ly = league_year(season)
+    base = to_contract_years(load_raw(contracts))
+    txns = load_transactions(overlay)
+    res = apply_transactions(base, txns, season)
+
+    console.print(f"[bold]applied {len(txns)} transaction(s)[/bold]")
+    for line in res.log:
+        console.print(f"  {line}")
+    if res.warnings:
+        console.print("\n[yellow]warnings:[/yellow]")
+        for w in res.warnings:
+            console.print(f"  [yellow]![/yellow] {w}")
+
+    teams = [team] if team else sorted(res.frame["team_abbrev"].unique().to_list())
+    for tm in teams:
+        roster = res.frame.filter(pl.col("team_abbrev") == tm).sort(
+            "cap_hit", descending=True
+        )
+        total = int(roster["cap_hit"].sum())
+        count = roster.filter(~pl.col("needs_review")).height
+        band = ly.apron_status(total)
+        color = "red" if band == "over_second_apron" else (
+            "yellow" if band in ("between_aprons", "over_first_apron") else "green"
+        )
+        flags = []
+        if count > ly.max_roster:
+            flags.append(f"{count} players > {ly.max_roster} max")
+        if count < ly.min_roster:
+            flags.append(f"{count} players < {ly.min_roster} min")
+        flagstr = f"  [red]({'; '.join(flags)})[/red]" if flags else ""
+        if team or tm == team or (team is None and total > ly.first_apron):
+            console.print(
+                f"\n[bold]{tm}[/bold]: ${total:,} base  "
+                f"[{color}]{band}[/{color}]  {count} players{flagstr}"
+            )
+            if team:
+                for r in roster.select("player", "cap_hit").iter_rows(named=True):
+                    console.print(f"  {r['player']:28s} ${r['cap_hit']:>12,}")
+
+
 @app.command("check-minutes")
-def check_minutes_cmd(season: str = typer.Option(CURRENT_SEASON)) -> None:
+def check_minutes_cmd(
+    season: str = typer.Option(CURRENT_SEASON),
+    limit: int = typer.Option(20, help="check this many games (0 = all)"),
+    synthetic: bool = typer.Option(
+        False, "--synthetic", help="run the gate on generated games (no data needed)"
+    ),
+) -> None:
     """Stage 2 gate: reconstructed minutes vs official box score.
 
-    Do not start the RAPM work until this passes. A lineup reconstruction
-    that is quietly wrong produces a design matrix that is quietly wrong,
-    and you will not find out from the regression diagnostics.
+    Do not build RAPM until this passes on real data. A lineup
+    reconstruction that is quietly wrong produces a design matrix that is
+    quietly wrong, and the regression will not tell you.
+
+    --synthetic runs the gate on generated games with known ground truth,
+    which needs no warehouse and proves the reconstruction logic end to end.
     """
-    console.print("[yellow]not implemented until stint builder exists (Stage 2)")
+    from nbare.rapm.stints import reconstruct_game, validate_minutes
+
+    if synthetic:
+        from nbare.rapm.synthetic import box_frame, make_game
+
+        failures = 0
+        for seed in range(limit or 20):
+            g = make_game(seed=seed)
+            res = reconstruct_game(g.pbp)
+            chk = validate_minutes(res, box_frame(g))
+            if not chk.passed:
+                failures += 1
+                console.print(f"[red]seed {seed}: {chk.summary()}")
+        n = limit or 20
+        if failures:
+            console.print(f"[red]{failures}/{n} synthetic games FAILED")
+        else:
+            console.print(f"[green]all {n} synthetic games passed the minutes gate")
+        return
+
+    # Real path: read PBP + box scores from the warehouse.
+    with session(read_only=True) as con:
+        games = con.execute(
+            "SELECT game_id FROM stg.game WHERE season = ? ORDER BY game_date"
+            + (f" LIMIT {limit}" if limit else ""),
+            [season],
+        ).fetchall()
+        if not games:
+            console.print(
+                "[yellow]no games in warehouse. Run `make games`/`make pbp` "
+                "first, or try --synthetic to test the logic now."
+            )
+            return
+
+        passed = failed = 0
+        for (gid,) in games:
+            pbp = con.execute(
+                "SELECT * FROM stg.pbp_event WHERE game_id = ?", [gid]
+            ).pl()
+            box = con.execute(
+                "SELECT * FROM stg.box_player WHERE game_id = ?", [gid]
+            ).pl()
+            if pbp.is_empty() or box.is_empty():
+                continue
+            res = reconstruct_game(pbp)
+            chk = validate_minutes(res, box)
+            if chk.passed:
+                passed += 1
+            else:
+                failed += 1
+                console.print(f"[red]{gid}: {chk.summary()}")
+
+    total = passed + failed
+    color = "green" if failed == 0 else "red"
+    console.print(
+        f"[{color}]minutes gate: {passed}/{total} games passed"
+        + ("" if failed == 0 else f" -- {failed} FAILED, do not build RAPM yet")
+    )
 
 
 if __name__ == "__main__":

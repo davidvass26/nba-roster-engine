@@ -140,10 +140,125 @@ So the aggregate is deliberately named `base_salary_total`, **not**
 flag; Stage 1 should decline to certify a payroll for any team containing
 one rather than emit a confident wrong number.
 
+## Stage 1 — CBA salary-matching engine (shipped, scoped)
+
+`nbare check-trade <csv> --send <slug> --receive <slug>` validates the
+salary-matching legality of a swap and prints a per-team verdict citing the
+specific CBA band.
+
+**Verified rules (2023 CBA, fully phased in from 2024-25).** The matching
+bands are fixed dollar figures in the CBA -- they do NOT scale with the cap
+-- so 2026-27 uses the same bands as 2024-25. For a team below the first
+apron after the trade, sending out salary S:
+
+| Outgoing S | May take back |
+|---|---|
+| S ≤ $7.5M | 200% of S + $250K |
+| $7.5M < S ≤ $29M | S + $7.5M |
+| S > $29M | 125% of S + $250K |
+
+A team **above** either apron is held to a flat **100%** of outgoing, with
+no aggregation benefit. That single rule is why apron teams can't trade a
+$33M player for a $39M player: 100% matching caps the return at what they
+send out.
+
+**These ceilings are validated against real published worked examples** and
+locked in as regression tests: Tre Mann ($3,191,400 → $6,632,800), Oladipo
+($9,450,000 → $16,950,000), Wiggins (~$26.3M → ~$33.8M). Both band
+boundaries ($7.5M, $29M) are tested for off-by-one. All money math is exact
+integer/Decimal — no float ever touches a cap figure.
+
+**Three-valued verdicts, by design.** A check returns LEGAL, ILLEGAL, or
+**INDETERMINATE**. The third is not a failure — it means a fact the current
+data can't supply (likely incentives, cap-room absorption, dead-money
+attribution) could change the answer, so the engine declines to certify
+rather than guess. A team sitting within $5M of an apron with unobserved
+incentives is automatically downgraded from LEGAL to INDETERMINATE. This is
+the honesty property from Stage 0 carried into the rules: an engine that
+says "I can't verify this" is more credible to a front office than one that
+always answers.
+
+**Scope boundary.** This module does salary matching only, because that is
+what base salaries alone can support. It does NOT yet compute which apron a
+move hard-caps a team into, because that needs exact apron payroll
+(including likely incentives) and dead-money attribution — both flagged
+missing in the contract-data section above. Those are the next data
+unblocks, not rule-engine work.
+
+## Updating the data: transaction overlays
+
+The contract CSV is a snapshot and the league doesn't stop moving. Rather
+than hand-edit the CSV (which loses your point-in-time record and invites
+errors like leaving a player on two teams), changes live in a small,
+ordered YAML overlay applied on top of the immutable base:
+
+```bash
+nbare apply-overrides data/raw/bbref_contracts_2026-27.csv \
+    data/overrides/phi_2026_offseason.yaml --team PHI
+```
+
+Overlays are transaction logs, not find-and-replace, because the CBA treats
+each move type differently and the rule engine already knows the
+difference:
+
+| Type | Meaning |
+|---|---|
+| `sign` | a free agent joins a team at a stated **cap hit** (not headline salary) |
+| `waive` | a player leaves; `stretch_dead_money: true` keeps guaranteed money as a dead-money row |
+| `trade` | players (and cash) move between teams |
+| `amend` | override one field of one row (escape hatch) |
+
+The base is never mutated. Every action is logged, and anything suspicious
+(waiving a player who isn't on the named team, amending a row that doesn't
+exist) becomes a **warning** rather than silently applying — a wrong
+overlay that runs clean is worse than one that complains.
+
+The shipped example, `phi_2026_offseason.yaml`, encodes the real 2026
+Philadelphia moves and is instructive about why structure matters: LeBron
+**signed as a free agent** (a `sign`, and he wasn't even in the snapshot
+because free agents have no contract row — the system caught this with a
+warning when an `amend` no-op'd), and KCP was **bought out and re-signed at
+the vet minimum** — his cap hit is ~$2.4M, not the $3.9M headline. Applying
+it shows Philadelphia at ~$261.6M with 16 players: over the second apron and
+over the roster max, i.e. a roster that can't legally exist yet, which is
+exactly what the reporting says. You model the move; the engine tells you
+what else has to happen.
+
+## Stage 2 — lineup reconstruction + the minutes gate
+
+RAPM needs one design-matrix row per *stint* (a span where the 10 players
+on the floor don't change), so the foundation is reconstructing on-court
+lineups from play-by-play. The hard part: PBP gives you substitution
+*events*, not lineups, and a player can be on the floor for minutes before
+appearing in any event. The reconstructor infers each period's opening five
+per side (players who act before their first sub-in), then walks the subs.
+
+**This inference is validated, not trusted.** `nbare check-minutes` compares
+reconstructed on-floor seconds against the official box score for every
+player. Summed stint seconds must equal box-score minutes within tolerance.
+A reversed sub direction or a missed opener fails the gate loudly. **Do not
+build RAPM on a reconstruction that hasn't passed** — a lineup that's quietly
+wrong yields a design matrix that's quietly wrong, and the regression won't
+tell you.
+
+Because stats.nba.com is unreachable from CI, the logic is proven against a
+synthetic game generator with known ground truth: we build games forward
+with a controlled substitution timeline, then assert reconstruction inverts
+them to zero error. The reversed-sub test confirms the gate *catches* the
+classic bug, so it's trustworthy on real data where there's no ground truth.
+
+```bash
+nbare check-minutes --synthetic          # proves the logic, needs no data
+nbare check-minutes --season 2024-25     # the real gate, after a backfill
+```
+
 ## Status / known gaps
 
 - [x] Warehouse schema, ingestion client, CLI, test suite
 - [x] BBRef contract parser + data-quality report + crosswalk seed (444 slugs)
+- [x] Stage 1 salary-matching engine (verified bands, 3-valued verdicts, CLI)
+- [x] Transaction overlay system (sign/waive/trade/amend on immutable base)
+- [x] Stage 2 stint reconstruction + minutes-validation gate (synthetic-proven)
 - [ ] `config.LEAGUE_YEARS` — the 2026-27 cap/tax/apron/MLE figures are the
       official league release, but the **BAE and the 2025-26 secondary
       figures are unverified placeholders**. Confirm against the league
