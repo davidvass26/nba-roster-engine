@@ -252,6 +252,32 @@ nbare check-minutes --synthetic          # proves the logic, needs no data
 nbare check-minutes --season 2024-25     # the real gate, after a backfill
 ```
 
+## Stage 2 — the full RAPM pipeline (real-data path complete)
+
+The connector (`rapm/blocks.py`) closes the gap between reconstruction and
+regression. Reconstructed stints store all 10 players mixed; the design
+matrix needs them split by team (offense five vs defense five). The
+connector derives player->team from the box score, splits each stint,
+attributes events in the stint's time window to the offensive team, and
+emits two `OffenseBlock`s per stint. Stints that don't cleanly partition
+into two fives are skipped and counted, never forced.
+
+Validated the same way as everything else: `make_scoring_game` plants exact
+per-segment points and possessions, and the connector recovers them to the
+dollar across seeds. The full chain — scoring game -> connector -> sparse
+design -> ridge fit — runs end to end in tests, so the only thing between
+here and real ratings is a play-by-play backfill.
+
+```bash
+make games SEASON=2024-25 && make pbp SEASON=2024-25
+nbare check-minutes --season 2024-25     # gate MUST pass first
+nbare fit-rapm --season 2024-25          # offense/defense RAPM, top players
+```
+
+`fit-rapm` runs the whole real-data chain and prints the top players by
+total RAPM with offense/defense split. Trust it only after the minutes gate
+passes for the season.
+
 ## Status / known gaps
 
 - [x] Warehouse schema, ingestion client, CLI, test suite
@@ -259,6 +285,7 @@ nbare check-minutes --season 2024-25     # the real gate, after a backfill
 - [x] Stage 1 salary-matching engine (verified bands, 3-valued verdicts, CLI)
 - [x] Transaction overlay system (sign/waive/trade/amend on immutable base)
 - [x] Stage 2 stint reconstruction + minutes-validation gate (synthetic-proven)
+- [x] Stage 2 RAPM: possessions, sparse design, ridge+grouped-CV, stints->blocks connector, fit-rapm CLI
 - [ ] `config.LEAGUE_YEARS` — the 2026-27 cap/tax/apron/MLE figures are the
       official league release, but the **BAE and the 2025-26 secondary
       figures are unverified placeholders**. Confirm against the league

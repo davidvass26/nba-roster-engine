@@ -322,6 +322,81 @@ def apply_overrides_cmd(
                     console.print(f"  {r['player']:28s} ${r['cap_hit']:>12,}")
 
 
+@app.command("fit-rapm")
+def fit_rapm_cmd(
+    season: str = typer.Option(CURRENT_SEASON),
+    limit: int = typer.Option(0, help="cap games (0 = all in season)"),
+    min_possessions: float = typer.Option(1.0, help="drop tiny blocks"),
+    top: int = typer.Option(25, help="print this many top players"),
+) -> None:
+    """Fit offense/defense RAPM from the warehouse for a season.
+
+    Runs the full real-data chain: reconstruct stints -> split by team ->
+    offense blocks -> sparse design -> ridge with grouped CV. Requires a
+    play-by-play + box-score backfill (`make pbp`) and should only be
+    trusted after `check-minutes` passes for the season.
+    """
+    from nbare.rapm.blocks import blocks_from_warehouse
+    from nbare.rapm.design import build_design
+    from nbare.rapm.fit import fit_rapm
+
+    with session() as con:
+        rows = con.execute(
+            "SELECT game_id FROM stg.game WHERE season = ? ORDER BY game_date"
+            + (f" LIMIT {limit}" if limit else ""),
+            [season],
+        ).fetchall()
+        if not rows:
+            console.print(
+                "[yellow]no games in warehouse for that season. Run "
+                "`make games`/`make pbp` first."
+            )
+            return
+        game_ids = [r[0] for r in rows]
+        console.print(f"building blocks from {len(game_ids):,} games...")
+        blockres = blocks_from_warehouse(con, game_ids)
+
+        # Attach readable names if we have them.
+        names = {
+            r[0]: r[1]
+            for r in con.execute(
+                "SELECT nba_player_id, full_name FROM stg.player"
+            ).fetchall()
+        }
+
+    if not blockres.blocks:
+        console.print("[red]no usable blocks produced (check the minutes gate).")
+        return
+    console.print(
+        f"{len(blockres.blocks):,} blocks, {blockres.skipped_stints} stints "
+        "skipped (bad team split)"
+    )
+
+    design = build_design(blockres.blocks, min_possessions=min_possessions)
+    console.print(
+        f"design: {design.X.shape[0]:,} rows x {design.X.shape[1]:,} cols; "
+        "fitting with grouped CV..."
+    )
+    result = fit_rapm(design)
+    console.print(
+        f"selected lambda: {result.best_lambda}  "
+        f"(intercept {result.intercept:.1f} pts/100)"
+    )
+
+    t = Table(title=f"Top {top} by total RAPM — {season}")
+    t.add_column("#", justify="right")
+    t.add_column("player")
+    t.add_column("total", justify="right")
+    t.add_column("off", justify="right")
+    t.add_column("def", justify="right")
+    for i, (pid, total, off, deff) in enumerate(result.ranking()[:top], 1):
+        t.add_row(
+            str(i), names.get(pid, str(pid)),
+            f"{total:+.1f}", f"{off:+.1f}", f"{deff:+.1f}",
+        )
+    console.print(t)
+
+
 @app.command("check-minutes")
 def check_minutes_cmd(
     season: str = typer.Option(CURRENT_SEASON),
