@@ -14,7 +14,10 @@ projected wins under the 2023 CBA. It is built in stages:
 - **Stage 0** — data warehouse (DuckDB), cached ingestion, contract parsing
 - **Stage 1** — CBA rule engine (salary matching shipped; hard-cap triggers pending data)
 - **Stage 2** — Bayesian RAPM impact metric (ridge + box-score prior + on/off diagnostic shipped)
-- **Stage 3** — multi-year player projections (not started)
+- **Stage 3** — multi-year player projections (v1 shipped: delta-method aging
+  curve + player/position/league partial pooling + box-score baseline,
+  numpyro/arviz; see `docs/stage3_spec.md`. Attrition, availability, and
+  box-score-modulated curve shape deferred to v2.)
 - **Stage 4** — MILP roster optimizer (not started)
 - **Stage 5** — agent layer + eval harness (not started)
 
@@ -72,6 +75,11 @@ flag it rather than working around it.
   Commit green so every point in history is a working state.
 - **Add tests with every behavior change.** This repo's credibility is its
   test suite. A change without a test is incomplete.
+- - **Build multi-part computations one layer at a time.** Implement and
+  validate each layer against planted synthetic ground truth before adding
+  the next. Never build a full model at once — layered validation is how
+  upstream bugs get localized. (This discipline caught the connector bug in
+  Stage 2 and is the project's core credibility mechanism.)
 - **Keep prose docstrings that explain *why*.** The modules have long
   header docstrings explaining the reasoning and the traps. Preserve and
   extend them; they are the difference between this reading as a serious
@@ -119,6 +127,17 @@ src/nbare/
     fit.py             ridge RAPM with grouped (by game) cross-validation
     blocks.py          connector: stints -> offense blocks for the design
     synthetic.py       ground-truth game generators for validation
+    prior.py           box-score-informed prior mean for Bayesian RAPM
+  projection/
+    types.py           PlayerSeason: the shared per-layer input record
+    delta.py           layer 1: delta-method aging curve (survivorship-safe)
+    hierarchy.py        layer 2: player -> position -> league partial pooling
+                         (numpyro, non-centered parameterization)
+    baseline.py         layer 3: box-score-informed baseline prior, reusing
+                         rapm/prior.py's BoxScoreRow/feature sets/regression
+    project.py          top-level: posterior samples per player per future
+                         year, shaped for the Stage 4 optimizer
+    synthetic.py        ground-truth player-panel generators for validation
   cli.py               `nbare` command (typer)
 ```
 
