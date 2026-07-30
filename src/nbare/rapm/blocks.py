@@ -193,3 +193,59 @@ def blocks_from_warehouse(con, game_ids: list[str]) -> BlockResult:
     return BlockResult(
         blocks=all_blocks, skipped_stints=total_skipped, warnings=warnings
     )
+
+
+def on_off_defense(blocks: list[OffenseBlock]) -> dict[int, "object"]:
+    """Compute on/off defensive rating for every player from offense blocks.
+
+    For each player we accumulate, over all defensive blocks (blocks where
+    they are on the DEFENSE side), opponent points and possessions while
+    they are ON the floor; and separately, over every block where they are
+    NOT on the floor at all, the opponent points/possessions while OFF.
+
+    "Off" here means blocks in which the player appears on neither side --
+    i.e. genuinely resting. Returns OnOffDefense per player. Players who are
+    never off (impossible in real data, possible in tiny synthetic sets) get
+    off-possessions of zero and are effectively skipped by diagnostics.
+
+    This is an INDEPENDENT check on defensive RAPM, not a competing metric.
+    """
+    from nbare.rapm.fit import OnOffDefense
+
+    # opponent efficiency of a defensive block = points the OFFENSE scored.
+    # For a player on defense in a block, the block's points are what they
+    # allowed. For "off", we need blocks where the player is absent entirely.
+    on_pts: dict[int, float] = {}
+    on_poss: dict[int, float] = {}
+    off_pts: dict[int, float] = {}
+    off_poss: dict[int, float] = {}
+
+    all_players: set[int] = set()
+    for b in blocks:
+        all_players |= b.offense | b.defense
+
+    for pid in all_players:
+        on_pts[pid] = on_poss[pid] = off_pts[pid] = off_poss[pid] = 0.0
+
+    for b in blocks:
+        on_court = b.offense | b.defense
+        for pid in b.defense:
+            on_pts[pid] += b.points
+            on_poss[pid] += b.possessions
+        # "off" = players not on the court at all for this defensive block
+        for pid in all_players - on_court:
+            off_pts[pid] += b.points
+            off_poss[pid] += b.possessions
+
+    out: dict[int, object] = {}
+    for pid in all_players:
+        on_eff = (100.0 * on_pts[pid] / on_poss[pid]) if on_poss[pid] > 0 else 0.0
+        off_eff = (100.0 * off_pts[pid] / off_poss[pid]) if off_poss[pid] > 0 else 0.0
+        out[pid] = OnOffDefense(
+            player_id=pid,
+            opp_pts_100_on=on_eff,
+            opp_pts_100_off=off_eff,
+            def_possessions_on=on_poss[pid],
+            def_possessions_off=off_poss[pid],
+        )
+    return out

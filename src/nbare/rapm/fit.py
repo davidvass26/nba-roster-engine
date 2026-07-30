@@ -148,3 +148,89 @@ def fit_rapm(
         n_rows=design.X.shape[0],
         n_players=design.n_players,
     )
+
+
+def fit_rapm_bayesian(
+    design: DesignMatrix,
+    prior_mu: np.ndarray,
+    lambda_grid: tuple[float, ...] = DEFAULT_LAMBDA_GRID,
+    n_splits: int = 5,
+    fixed_lambda: float | None = None,
+) -> RAPMResult:
+    """Fit RAPM shrinking toward a box-score prior mean instead of zero.
+
+    Ridge with prior mean mu minimizes ||X b - y||^2 + lambda ||b - mu||^2.
+    Closed form: substitute gamma = b - mu, giving target y' = y - X mu;
+    solve ordinary weighted ridge for gamma; then b = gamma + mu. This
+    reuses the exact same solver as plain ridge, so the only change is a
+    transformed target and adding mu back at the end.
+
+    A player with few possessions is pulled toward his box-score-predicted
+    rating (his slice of mu); a player with many possessions still has his
+    rating driven by the data. That is the whole point.
+    """
+    if prior_mu.shape[0] != design.X.shape[1]:
+        raise ValueError(
+            f"prior_mu has {prior_mu.shape[0]} entries but design has "
+            f"{design.X.shape[1]} columns"
+        )
+
+    # Transform the target: y' = y - X mu. Everything downstream is ordinary
+    # ridge on (X, y', w); we add mu back to the coefficients at the end.
+    offset = design.X @ prior_mu
+    y_shifted = design.y - offset
+
+    shifted = DesignMatrix(
+        X=design.X, y=y_shifted, w=design.w,
+        player_index=design.player_index, n_players=design.n_players,
+        group=design.group,
+    )
+    if fixed_lambda is not None:
+        best_lambda, cv_scores = fixed_lambda, {fixed_lambda: float("nan")}
+    else:
+        best_lambda, cv_scores = select_lambda(shifted, lambda_grid, n_splits)
+
+    model = Ridge(alpha=best_lambda, fit_intercept=True, solver="sparse_cg")
+    model.fit(shifted.X, shifted.y, sample_weight=shifted.w)
+
+    coef = model.coef_ + prior_mu  # add the prior mean back
+    offense: dict[int, float] = {}
+    defense: dict[int, float] = {}
+    for pid, i in design.player_index.items():
+        offense[pid] = float(coef[2 * i])
+        defense[pid] = float(coef[2 * i + 1])
+
+    return RAPMResult(
+        offense=offense,
+        defense=defense,
+        intercept=float(model.intercept_),
+        best_lambda=best_lambda,
+        cv_scores=cv_scores,
+        n_rows=design.X.shape[0],
+        n_players=design.n_players,
+    )
+
+
+@dataclass
+class OnOffDefense:
+    """On/off defensive rating for one player: opponent points per 100
+    possessions with the player ON the floor vs OFF it. Negative `diff`
+    means the team defends BETTER (allows fewer points) with them on.
+
+    This is a crude, contaminated measure -- it does not adjust for
+    teammates the way RAPM does -- which is exactly why it is a useful
+    INDEPENDENT check on defensive RAPM rather than a competing metric. If a
+    player's defensive RAPM and on/off agree, that is real corroboration
+    from a differently-computed signal.
+    """
+
+    player_id: int
+    opp_pts_100_on: float
+    opp_pts_100_off: float
+    def_possessions_on: float
+    def_possessions_off: float
+
+    @property
+    def diff(self) -> float:
+        """on minus off; negative == defends better on the floor."""
+        return self.opp_pts_100_on - self.opp_pts_100_off

@@ -261,6 +261,168 @@ def check_trade_cmd(
         console.print()
 
 
+@app.command("sign")
+def sign_cmd(
+    contracts: str = typer.Argument(..., help="base BBRef contract CSV"),
+    player: str = typer.Option(..., help="display name, e.g. 'LeBron James'"),
+    team: str = typer.Option(..., help="team abbreviation, e.g. PHI"),
+    cap_hit: int = typer.Option(..., help="cap hit in whole dollars, e.g. 4000000"),
+    slug: str = typer.Option(None, help="BBRef slug if known, e.g. jamesle01"),
+    guaranteed: int = typer.Option(None, help="guaranteed dollars (defaults to full cap hit)"),
+    season: str = typer.Option(CURRENT_SEASON),
+    note: str = typer.Option("", help="optional free-text note"),
+    show_team: bool = typer.Option(True, help="print the team's cap sheet after signing"),
+) -> None:
+    """Sign a player to a team and show the cap impact.
+
+    This applies a single signing on top of the base contract snapshot and
+    prints the result — no YAML file needed. Under the hood it uses the same
+    transaction overlay system as apply-overrides, so the base CSV is never
+    modified.
+
+    Examples
+    --------
+    # LeBron James signing with PHI at $4M (year 1 of 2yr/$8M):
+    nbare sign data/raw/bbref_contracts_2026-27.csv \\
+        --player "LeBron James" --slug jamesle01 --team PHI --cap-hit 4000000
+
+    # A hypothetical NTMLE signing in Denver:
+    nbare sign data/raw/bbref_contracts_2026-27.csv \\
+        --player "Free Agent" --team DEN --cap-hit 15000000
+    """
+    import polars as pl
+
+    from nbare.config import league_year
+    from nbare.ingest.contracts import load_raw, to_contract_years
+    from nbare.ingest.transactions import Sign, apply_transactions
+
+    ly = league_year(season)
+    base = to_contract_years(load_raw(contracts))
+    gtd = guaranteed if guaranteed is not None else cap_hit
+
+    txn = Sign(
+        player=player,
+        slug=slug,
+        team=team,
+        cap_hit=cap_hit,
+        guaranteed=gtd,
+        note=note,
+    )
+    result = apply_transactions(base, [txn], season)
+
+    for w in result.warnings:
+        console.print(f"[yellow]![/yellow] {w}")
+
+    console.print(f"\n[green]signed[/green] {player} → {team} @ ${cap_hit:,}/yr  "
+                  f"(gtd ${gtd:,})")
+
+    if show_team:
+        roster = result.frame.filter(
+            pl.col("team_abbrev") == team
+        ).sort("cap_hit", descending=True)
+        total = int(roster["cap_hit"].sum())
+        band = ly.apron_status(total)
+        bcolor = {
+            "over_second_apron": "red",
+            "between_aprons": "yellow",
+            "taxpayer": "yellow",
+        }.get(band, "green")
+
+        t = Table(
+            title=f"{team} after signing  "
+                  f"[{bcolor}]${total:,} ({band})[/{bcolor}]  "
+                  f"{roster.height} players"
+        )
+        t.add_column("player")
+        t.add_column("cap hit", justify="right")
+        t.add_column("gtd", justify="right")
+        for r in roster.select("player", "cap_hit", "guaranteed").iter_rows(named=True):
+            gtd_str = "✓" if r["guaranteed"] == r["cap_hit"] else f"${r['guaranteed']:,}"
+            t.add_row(r["player"], f"${r['cap_hit']:,}", gtd_str)
+        console.print(t)
+        console.print(
+            f"\n  [dim]first apron ${ly.first_apron:,} | "
+            f"second apron ${ly.second_apron:,}[/dim]"
+        )
+        if total > ly.second_apron:
+            console.print(f"  [red]⚠ over the second apron by ${total - ly.second_apron:,}[/red]")
+        elif total > ly.first_apron:
+            console.print(f"  [yellow]⚠ over the first apron by ${total - ly.first_apron:,}[/yellow]")
+
+
+@app.command("waive")
+def waive_cmd(
+    contracts: str = typer.Argument(..., help="base BBRef contract CSV"),
+    slug: str = typer.Option(..., help="BBRef slug of the player to waive"),
+    team: str = typer.Option(..., help="team abbreviation"),
+    stretch: bool = typer.Option(False, "--stretch", help="leave guaranteed money as dead money"),
+    season: str = typer.Option(CURRENT_SEASON),
+    note: str = typer.Option("", help="optional free-text note"),
+) -> None:
+    """Waive a player and show the team's updated cap sheet.
+
+    By default, the player's salary comes fully off the books (correct for
+    non-guaranteed deals). Use --stretch to keep the guaranteed amount as a
+    dead-money row (correct for waived guaranteed contracts).
+
+    Example
+    -------
+    nbare waive data/raw/bbref_contracts_2026-27.csv --slug terryda01 --team PHI
+    """
+    import polars as pl
+
+    from nbare.config import league_year
+    from nbare.ingest.contracts import load_raw, to_contract_years
+    from nbare.ingest.transactions import Waive, apply_transactions
+
+    ly = league_year(season)
+    base = to_contract_years(load_raw(contracts))
+
+    # Show who we're waiving before we do it.
+    row = base.filter(
+        (pl.col("bbref_slug") == slug) & (pl.col("season") == season)
+    ).to_dicts()
+    if row:
+        r = row[0]
+        console.print(
+            f"\nwaiving [bold]{r['player']}[/bold] ({r['team_abbrev']}) "
+            f"${r['cap_hit']:,}  gtd=${r['guaranteed']:,}"
+            + (" — dead money stays" if stretch and r["guaranteed"] > 0 else " — clean removal")
+        )
+    else:
+        console.print(f"[yellow]slug {slug!r} not found for {season}; applying anyway[/yellow]")
+
+    txn = Waive(slug=slug, team=team, stretch_dead_money=stretch, note=note)
+    result = apply_transactions(base, [txn], season)
+
+    for w in result.warnings:
+        console.print(f"[yellow]![/yellow] {w}")
+
+    roster = result.frame.filter(
+        pl.col("team_abbrev") == team
+    ).sort("cap_hit", descending=True)
+    total = int(roster["cap_hit"].sum())
+    band = ly.apron_status(total)
+    bcolor = {
+        "over_second_apron": "red",
+        "between_aprons": "yellow",
+        "taxpayer": "yellow",
+    }.get(band, "green")
+
+    t = Table(
+        title=f"{team} after waive  "
+              f"[{bcolor}]${total:,} ({band})[/{bcolor}]  "
+              f"{roster.height} players"
+    )
+    t.add_column("player")
+    t.add_column("cap hit", justify="right")
+    for r in roster.select("player", "cap_hit", "needs_review").iter_rows(named=True):
+        flag = " [dim](dead)[/dim]" if r["needs_review"] else ""
+        t.add_row(r["player"] + flag, f"${r['cap_hit']:,}")
+    console.print(t)
+
+
+
 @app.command("apply-overrides")
 def apply_overrides_cmd(
     contracts: str = typer.Argument(..., help="base BBRef contract CSV"),
@@ -304,7 +466,7 @@ def apply_overrides_cmd(
         count = roster.filter(~pl.col("needs_review")).height
         band = ly.apron_status(total)
         color = "red" if band == "over_second_apron" else (
-            "yellow" if band in ("between_aprons", "over_first_apron") else "green"
+            "yellow" if band in ("between_aprons", "taxpayer") else "green"
         )
         flags = []
         if count > ly.max_roster:
@@ -312,7 +474,7 @@ def apply_overrides_cmd(
         if count < ly.min_roster:
             flags.append(f"{count} players < {ly.min_roster} min")
         flagstr = f"  [red]({'; '.join(flags)})[/red]" if flags else ""
-        if team or tm == team or (team is None and total > ly.first_apron):
+        if team or total > ly.first_apron:
             console.print(
                 f"\n[bold]{tm}[/bold]: ${total:,} base  "
                 f"[{color}]{band}[/{color}]  {count} players{flagstr}"
@@ -320,7 +482,6 @@ def apply_overrides_cmd(
             if team:
                 for r in roster.select("player", "cap_hit").iter_rows(named=True):
                     console.print(f"  {r['player']:28s} ${r['cap_hit']:>12,}")
-
 
 @app.command("fit-rapm")
 def fit_rapm_cmd(

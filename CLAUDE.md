@@ -13,7 +13,7 @@ projected wins under the 2023 CBA. It is built in stages:
 
 - **Stage 0** — data warehouse (DuckDB), cached ingestion, contract parsing
 - **Stage 1** — CBA rule engine (salary matching shipped; hard-cap triggers pending data)
-- **Stage 2** — Bayesian RAPM impact metric (ridge pipeline shipped; box-score prior pending)
+- **Stage 2** — Bayesian RAPM impact metric (ridge + box-score prior + on/off diagnostic shipped)
 - **Stage 3** — multi-year player projections (not started)
 - **Stage 4** — MILP roster optimizer (not started)
 - **Stage 5** — agent layer + eval harness (not started)
@@ -94,7 +94,7 @@ flag it rather than working around it.
 
 ## Module map
 
-\`\`\`
+```
 src/nbare/
   config.py            LeagueYear cap figures (data, not constants); paths
   domain/
@@ -120,18 +120,18 @@ src/nbare/
     blocks.py          connector: stints -> offense blocks for the design
     synthetic.py       ground-truth game generators for validation
   cli.py               `nbare` command (typer)
-\`\`\`
+```
 
 ## Common commands
 
-\`\`\`bash
+```bash
 make test                                  # full suite
 nbare check-minutes --synthetic            # prove stint logic, no data
 nbare ingest-contracts data/raw/<csv>      # contract data-quality report
 nbare check-trade <csv> --send X --receive Y   # salary-matching legality
 nbare apply-overrides <csv> <overlay.yaml> --team PHI
 nbare fit-rapm --season 2024-25            # needs a local backfill first
-\`\`\`
+```
 
 ## Gotchas already fixed (do not reintroduce)
 
