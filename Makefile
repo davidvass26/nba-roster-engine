@@ -1,4 +1,4 @@
-.PHONY: install test lint db teams players games pbp xwalk status clean
+.PHONY: install test lint db teams players games pbp box xwalk status clean
 
 install:
 	pip install -e ".[dev,scrape]"
@@ -25,6 +25,11 @@ games:
 # The long one. ~1300 games/season, ~0.75s each => ~20 min/season.
 pbp:
 	nbare ingest-pbp --season $(SEASON)
+
+# One request per game, same cost profile as pbp. Fills stg.box_player,
+# which check-minutes and fit-rapm need and nothing wrote to before this.
+box:
+	nbare ingest-box --season $(SEASON)
 
 xwalk:
 	nbare build-xwalk

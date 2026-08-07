@@ -107,6 +107,18 @@ def reconstruct_game(
     the first person slot and the incoming in the second on a substitution
     row. If a particular endpoint reverses this, the minutes check will
     fail loudly -- which is exactly what the gate is for.
+
+    NB on event ordering: events are sorted by CLOCK, not by event_num.
+    event_num (nba.com's own action counter) is not always chronological --
+    confirmed on a real game where one substitution's recorded clock put it
+    ~100s earlier than its event_num position implied, causing the stint
+    cutter to "rewind" and double-count a 100-second window for every
+    player on the floor during it (the exact-100s-per-player pattern is
+    what gave this away; it was not garbage-time noise, it was one bad
+    ordering assumption applied uniformly). clock_seconds_left is the
+    actual chronological signal; event_num is only a reliable TIEBREAKER
+    for genuinely simultaneous events (identical clock, e.g. a mass
+    substitution wave), never the primary sort key.
     """
     warnings: list[str] = []
     if pbp.is_empty():
@@ -117,7 +129,10 @@ def reconstruct_game(
     player_seconds: dict[int, float] = {}
 
     for period in sorted(pbp["period"].unique().to_list()):
-        pev = pbp.filter(pl.col("period") == period).sort("event_num")
+        pev = (
+            pbp.filter(pl.col("period") == period)
+            .sort(["clock_seconds_left", "event_num"], descending=[True, False])
+        )
         opening = _infer_period_openers(pev, sub_out_col, sub_in_col)
         if len(opening) != 10:
             warnings.append(
@@ -169,14 +184,33 @@ def _infer_period_openers(
     something (appear in any player slot of any event) BEFORE they are first
     subbed IN. Equivalently: the set of players subbed OUT before ever being
     subbed IN were openers, plus anyone active before their first sub-in.
+
+    `pev` must already be sorted chronologically (by clock, not event_num --
+    see `reconstruct_game`'s docstring). The "before/after" comparison here
+    uses each row's POSITION in that order, not its raw event_num: a real
+    game showed event_num is not always chronological, so comparing stored
+    event_num values numerically would silently reintroduce the same bug
+    even after the caller's sort was fixed.
+
+    A Technical foul is EXCLUDED from "appearance" evidence. Confirmed on
+    real data: a bench player can be charged a technical (for arguing from
+    the bench, e.g. Matisse Thybulle, personId 1629680, box-score minutes
+    0) without ever setting foot on the court -- unlike every other action
+    type here (shots, rebounds, live fouls, assists), a technical does not
+    require floor presence. Without this exclusion that player gets
+    wrongly inferred as a period opener and credited a full period/game of
+    phantom minutes. A player who genuinely IS on the floor when charged a
+    technical (confirmed: real player technicals show a nonzero personal-
+    foul count, "(P3.T4)", vs. a bench technical's "(P0.T1)") is unaffected
+    -- he is still correctly identified as present via his other actions
+    in the period.
     """
-    subbed_in_at: dict[int, int] = {}   # player -> event_num of first sub-in
-    appears_at: dict[int, int] = {}     # player -> event_num of first appearance
+    subbed_in_at: dict[int, int] = {}   # player -> position of first sub-in
+    appears_at: dict[int, int] = {}     # player -> position of first appearance
 
     id_cols = [c for c in ("player1_id", "player2_id", "player3_id") if c in pev.columns]
 
-    for row in pev.iter_rows(named=True):
-        en = row["event_num"]
+    for position, row in enumerate(pev.iter_rows(named=True)):
         is_sub = _is_sub(row.get("event_type"))
         in_id = row.get(sub_in_col) if is_sub else None
         for c in id_cols:
@@ -187,9 +221,13 @@ def _infer_period_openers(
             # which does NOT prove they were already on the floor. Skip it.
             if is_sub and c == sub_in_col:
                 continue
-            appears_at.setdefault(pid, en)
+            # A Technical foul does not require floor presence -- see
+            # docstring. Skip it as appearance evidence too.
+            if row.get("event_action_type") == "Technical":
+                continue
+            appears_at.setdefault(pid, position)
         if in_id is not None:
-            subbed_in_at.setdefault(in_id, en)
+            subbed_in_at.setdefault(in_id, position)
 
     openers: set[int] = set()
     for pid, first_seen in appears_at.items():

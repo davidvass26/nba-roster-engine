@@ -198,10 +198,30 @@ def fetch(
 
 
 def _looks_empty(payload: dict[str, Any]) -> bool:
-    """True if every result set in the payload has zero rows."""
-    sets = payload.get("resultSets") or payload.get("resultSet") or []
-    if isinstance(sets, dict):
-        sets = [sets]
-    if not sets:
-        return True
-    return all(not (rs.get("rowSet") or []) for rs in sets)
+    """True if the payload looks like a soft-throttle empty response.
+
+    Two payload shapes exist across nba.com endpoints. Legacy tabular
+    endpoints ('resultSets'/'resultSet'): empty means every result set's
+    rowSet is []. Newer v3 endpoints return nested objects with no
+    resultSets key at all -- playbyplayv3 is `{"game": {"actions": [...]}}`,
+    boxscoretraditionalv3 is `{"boxScoreTraditional": {...}}` (confirmed by
+    reading nba_api's own per-endpoint parsers). There is no universal
+    rowSet to inspect for those, so treating "no resultSets key" as "empty"
+    (the previous behavior here) misclassifies every well-formed v3
+    response as throttled -- `fetch()` would retry it 5 times and then
+    raise, even though the request actually succeeded. This was caught
+    while building box-score ingestion (docs/box_ingest_spec.md): the very
+    first real fetch failed this way. For the v3 case we only flag it
+    empty when the payload has no content at all.
+    """
+    sets = payload.get("resultSets") or payload.get("resultSet")
+    if sets is not None:
+        if isinstance(sets, dict):
+            sets = [sets]
+        if not sets:
+            return True
+        return all(not (rs.get("rowSet") or []) for rs in sets)
+    # No legacy result-set key: fall back to "every top-level value is
+    # itself empty" (covers both {} and e.g. {"game": {}}) without needing
+    # to know this endpoint's specific nested structure.
+    return not any(payload.values())

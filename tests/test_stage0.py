@@ -212,6 +212,18 @@ def test_empty_detection():
     assert _looks_empty({})
 
 
+def test_empty_detection_v3_nested_shape_not_misflagged():
+    """Regression: v3 endpoints (playbyplayv3, boxscoretraditionalv3, ...)
+    have no 'resultSets' key at all. The old heuristic treated that as
+    'empty' unconditionally, so fetch() retried and raised on every real
+    v3 response even though the request succeeded -- caught building box
+    score ingestion (docs/box_ingest_spec.md)."""
+    assert not _looks_empty({"game": {"gameId": "1", "actions": [{"actionNumber": 1}]}})
+    assert not _looks_empty({"boxScoreTraditional": {"gameId": "1", "homeTeam": {}}})
+    assert _looks_empty({})
+    assert _looks_empty({"game": {}})
+
+
 # --- parsing -------------------------------------------------------------
 
 def test_result_set_to_df_snake_cases_headers():

@@ -88,6 +88,27 @@ def ingest_pbp_cmd(
     console.print(f"[green]pbp events: {n:,}")
 
 
+@app.command("ingest-box")
+def ingest_box_cmd(
+    season: str = typer.Option(CURRENT_SEASON),
+    limit: int = typer.Option(0, help="0 = all games in the season"),
+) -> None:
+    """Resumable. Cached games are skipped for free, so rerun freely."""
+    from nbare.ingest.nba_stats import ingest_box_scores
+
+    with session() as con:
+        rows = con.execute(
+            "SELECT game_id FROM stg.game WHERE season = ? ORDER BY game_date",
+            [season],
+        ).fetchall()
+        game_ids = [r[0] for r in rows]
+        if limit:
+            game_ids = game_ids[:limit]
+        console.print(f"backfilling box scores for {len(game_ids):,} games")
+        n = ingest_box_scores(con, game_ids)
+    console.print(f"[green]box score rows: {n:,}")
+
+
 @app.command("ingest-contracts")
 def ingest_contracts_cmd(
     path: str = typer.Argument(..., help="Basketball-Reference contract CSV"),
