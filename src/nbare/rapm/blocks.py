@@ -50,10 +50,115 @@ class BlockResult:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class GateExclusion:
+    """One game dropped from the RAPM fit because it failed the Stage 2
+    minutes gate, with why -- see `classify_gate_failure`."""
+
+    game_id: str
+    category: str  # "data-gap" | "surname-collision" | "isolated"
+    offenders: list[tuple[int, float, float]]  # (player_id, recon_s, box_s)
+
+
+@dataclass
+class WarehouseBlockResult:
+    """`blocks_from_warehouse`'s return: the usable blocks plus an honest
+    accounting of which games were left out and why. RAPM must only be fit
+    on stints that passed the minutes gate -- see `blocks_from_warehouse`.
+    """
+
+    blocks: list[OffenseBlock]
+    skipped_stints: int
+    warnings: list[str]
+    games_total: int
+    games_included: int
+    games_missing_data: int
+    stints_included: int
+    exclusions: list[GateExclusion]
+
+    def exclusion_summary(self) -> dict[str, int]:
+        counts = {"data-gap": 0, "surname-collision": 0, "isolated": 0}
+        for e in self.exclusions:
+            counts[e.category] += 1
+        return counts
+
+    @property
+    def games_excluded(self) -> int:
+        return len(self.exclusions)
+
+
 def player_team_map(box: pl.DataFrame, *, player_col: str = "nba_player_id",
                     team_col: str = "nba_team_id") -> dict[int, int]:
     """player_id -> team_id, from the box score."""
     return {r[player_col]: r[team_col] for r in box.iter_rows(named=True)}
+
+
+_NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
+
+
+def _last_name(full_name: str) -> str:
+    """Last name, stripping generational suffixes ("Jaren Jackson Jr." ->
+    "jackson", not "jr.") so surname-collision detection isn't fooled by
+    them."""
+    parts = full_name.strip().split()
+    while len(parts) > 1 and parts[-1].strip(".").lower() in _NAME_SUFFIXES:
+        parts.pop()
+    return parts[-1].lower() if parts else full_name.strip().lower()
+
+
+def classify_gate_failure(
+    offenders: list[tuple[int, float, float]],
+    box: pl.DataFrame,
+    names: dict[int, str],
+) -> str:
+    """Why a game failed the minutes gate, for an honest RAPM-fit exclusion
+    log. Three categories, checked in this order:
+
+    - "surname-collision": at least one offending player who DOES appear
+      in the play-by-play (reconstructed seconds != 0, so this is not a
+      pure data gap) shares a last name with a teammate on the same
+      roster that game. This is the known bug in the substitution
+      name-resolution fallback (`ingest.nba_stats._resolve_incoming_id`):
+      confirmed on real 2025-26 data for Grizzlies teammates GG Jackson /
+      Jaren Jackson Jr. (minutes swapped across 6 games) and Bucks/Wizards
+      pairs sharing "Johnson". Detected generally here (shared last name
+      with a real roster teammate), not by hardcoding those names, so it
+      also catches collisions not yet seen.
+    - "data-gap": every offending player has reconstructed seconds == 0,
+      i.e. they never appear in a single pbp event despite having box
+      minutes -- nba.com's play-by-play itself is missing them. Not a
+      reconstruction bug; nothing to fix.
+    - "isolated": a partial mismatch that is neither of the above -- not
+      yet diagnosed as systematic (e.g. the Yang Hansen case already noted
+      in `_names_consistent`: nba.com's own inconsistent naming for a
+      single player, not a collision with a teammate).
+    """
+    team_of = player_team_map(box)
+    last_names_by_team: dict[int, dict[str, list[int]]] = {}
+    for pid, tid in team_of.items():
+        nm = names.get(pid)
+        if not nm:
+            continue
+        last_names_by_team.setdefault(tid, {}).setdefault(_last_name(nm), []).append(pid)
+
+    has_surname_collision = False
+    all_zero = True
+    for pid, recon_s, _box_s in offenders:
+        if recon_s != 0:
+            all_zero = False
+        tid = team_of.get(pid)
+        nm = names.get(pid)
+        if tid is None or not nm:
+            continue
+        teammates = last_names_by_team.get(tid, {}).get(_last_name(nm), [])
+        if any(p != pid for p in teammates):
+            has_surname_collision = True
+
+    if has_surname_collision:
+        return "surname-collision"
+    if all_zero:
+        return "data-gap"
+    return "isolated"
 
 
 def split_lineup(
@@ -162,16 +267,38 @@ def blocks_for_game(
     return BlockResult(blocks=blocks, skipped_stints=skipped, warnings=warnings)
 
 
-def blocks_from_warehouse(con, game_ids: list[str]) -> BlockResult:
+def blocks_from_warehouse(con, game_ids: list[str]) -> WarehouseBlockResult:
     """End-to-end: read PBP + box from the warehouse, reconstruct stints,
     and emit blocks for a set of games. This is the real-data entry point
     the RAPM fit consumes.
+
+    Only games that PASS the Stage 2 minutes gate (`validate_minutes`) are
+    included. This is not a workaround for messy real data -- it is the
+    point: a lineup reconstruction the gate has flagged as wrong produces
+    stints (and therefore offense/defense blocks) that cannot be trusted,
+    and RAPM has no way to tell a wrong stint from a right one. A dropped
+    game is excluded entirely rather than partially trusted. Every drop is
+    recorded in the returned `WarehouseBlockResult` with a category (see
+    `classify_gate_failure`), so the fit is auditable, not silently
+    smaller.
     """
-    from nbare.rapm.stints import reconstruct_game
+    from nbare.rapm.stints import reconstruct_game, validate_minutes
 
     all_blocks: list[OffenseBlock] = []
     total_skipped = 0
     warnings: list[str] = []
+    exclusions: list[GateExclusion] = []
+    games_missing_data = 0
+    games_included = 0
+    stints_included = 0
+
+    valid_player_ids = {
+        r[0] for r in con.execute("SELECT nba_player_id FROM stg.player").fetchall()
+    }
+    names = {
+        r[0]: r[1]
+        for r in con.execute("SELECT nba_player_id, full_name FROM stg.player").fetchall()
+    }
 
     for gid in game_ids:
         pbp = con.execute(
@@ -181,17 +308,34 @@ def blocks_from_warehouse(con, game_ids: list[str]) -> BlockResult:
             "SELECT * FROM stg.box_player WHERE game_id = ?", [gid]
         ).pl()
         if pbp.is_empty() or box.is_empty():
+            games_missing_data += 1
             warnings.append(f"{gid}: missing pbp or box, skipped")
             continue
-        recon = reconstruct_game(pbp)
+
+        recon = reconstruct_game(pbp, valid_player_ids=valid_player_ids)
+        chk = validate_minutes(recon, box)
+        if not chk.passed:
+            category = classify_gate_failure(chk.offenders, box, names)
+            exclusions.append(GateExclusion(gid, category, chk.offenders))
+            continue
+
+        games_included += 1
+        stints_included += len(recon.stints)
         team_of = player_team_map(box)
         res = blocks_for_game(pbp, recon.stints, team_of)
         all_blocks.extend(res.blocks)
         total_skipped += res.skipped_stints
         warnings.extend(f"{gid}: {w}" for w in res.warnings)
 
-    return BlockResult(
-        blocks=all_blocks, skipped_stints=total_skipped, warnings=warnings
+    return WarehouseBlockResult(
+        blocks=all_blocks,
+        skipped_stints=total_skipped,
+        warnings=warnings,
+        games_total=len(game_ids),
+        games_included=games_included,
+        games_missing_data=games_missing_data,
+        stints_included=stints_included,
+        exclusions=exclusions,
     )
 
 

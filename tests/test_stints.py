@@ -13,6 +13,7 @@ import pytest
 
 from nbare.rapm.stints import (
     REGULATION_PERIOD_S,
+    audit_phantom_ids,
     period_length_s,
     reconstruct_game,
     validate_minutes,
@@ -194,3 +195,129 @@ def test_bench_technical_foul_is_not_floor_presence_evidence():
     # Player 2 (genuinely playing, technical is incidental) keeps his full
     # floor time -- the exclusion must not remove real presence evidence.
     assert res.player_seconds[2] == pytest.approx(720.0)
+
+
+def test_allowlist_filters_team_id_and_event_code_from_player_slots():
+    """Real bug (docs/phantom_filter_spec.ld): a team id or a small
+    event/replay code can land in a player-id slot and, absent a filter,
+    reads as ordinary period-opener evidence -- reconstructing as a
+    phantom player on the floor for the whole period. The allowlist (keep
+    only ids present in stg.player) closes this independent of which
+    event type the phantom rode in on, unlike a denylist keyed to specific
+    event types."""
+    import polars as pl
+
+    from nbare.rapm.synthetic import PBP_SCHEMA
+
+    TEAM_ID = 1610612758  # real NBA franchise id range, not a player
+    EVENT_CODE = 486      # small replay/event code, not a player
+
+    def ev(event_num, clock_s, event_type, p1=None, p2=None):
+        return {
+            "game_id": "g1", "event_num": event_num, "period": 1,
+            "clock_seconds_left": 720.0 - clock_s, "event_type": event_type,
+            "event_action_type": None, "description": "test",
+            "team_id": None, "player1_id": p1, "player2_id": p2,
+            "player3_id": None, "home_score": 0, "away_score": 0,
+        }
+
+    events = [
+        # Real players 1 and 2 open the period via genuine live-play.
+        ev(1, 5, "Made Shot", p1=1),
+        ev(2, 6, "Made Shot", p1=2),
+        # A team id and an event code appear in player slots, each looking
+        # like ordinary appearance evidence to _infer_period_openers.
+        ev(3, 10, "Made Shot", p1=TEAM_ID),
+        ev(4, 12, "Instant Replay", p1=EVENT_CODE),
+        # Real players sub out at the end, both teams balanced.
+        ev(5, 700, "Substitution", p1=1, p2=3),
+        ev(6, 700, "Substitution", p1=2, p2=4),
+    ]
+    pbp = pl.DataFrame(events, schema=PBP_SCHEMA)
+
+    res = reconstruct_game(pbp, valid_player_ids={1, 2, 3, 4})
+
+    assert TEAM_ID not in res.player_seconds
+    assert EVENT_CODE not in res.player_seconds
+    for stint in res.stints:
+        assert TEAM_ID not in stint.lineup
+        assert EVENT_CODE not in stint.lineup
+    # Real players' minutes are unaffected by the filtered-out phantoms.
+    assert res.player_seconds[1] == pytest.approx(700.0)
+    assert res.player_seconds[2] == pytest.approx(700.0)
+    assert res.player_seconds[3] == pytest.approx(20.0)
+    assert res.player_seconds[4] == pytest.approx(20.0)
+
+
+def test_game_that_fails_only_due_to_phantom_ids_passes_with_allowlist():
+    """Without the allowlist, a phantom id that reads as opener evidence
+    occupies a floor slot for the whole period and has no matching
+    box-score row, which fails validate_minutes even though every real
+    player's minutes are already correct. The allowlist removes exactly
+    the phantom and nothing else, so the same game then passes."""
+    import polars as pl
+
+    from nbare.rapm.synthetic import PBP_SCHEMA
+
+    TEAM_ID = 1610612758
+
+    def ev(event_num, clock_s, event_type, p1=None, p2=None):
+        return {
+            "game_id": "g1", "event_num": event_num, "period": 1,
+            "clock_seconds_left": 720.0 - clock_s, "event_type": event_type,
+            "event_action_type": None, "description": "test",
+            "team_id": None, "player1_id": p1, "player2_id": p2,
+            "player3_id": None, "home_score": 0, "away_score": 0,
+        }
+
+    events = [
+        ev(1, 5, "Made Shot", p1=1),
+        ev(2, 10, "Made Shot", p1=TEAM_ID),  # phantom opener
+        ev(3, 700, "Substitution", p1=1, p2=2),
+    ]
+    pbp = pl.DataFrame(events, schema=PBP_SCHEMA)
+    box = pl.DataFrame({"nba_player_id": [1, 2], "seconds_played": [700, 20]})
+
+    unfiltered = reconstruct_game(pbp)
+    assert not validate_minutes(unfiltered, box).passed
+
+    filtered = reconstruct_game(pbp, valid_player_ids={1, 2})
+    check = validate_minutes(filtered, box)
+    assert check.passed, check.summary()
+
+
+def test_audit_phantom_ids_groups_by_event_type_with_counts():
+    """The diagnostic behind the allowlist: every non-player id in a player
+    slot, grouped by the event_type it came from, with counts -- not just
+    a yes/no leak flag."""
+    import polars as pl
+
+    from nbare.rapm.synthetic import PBP_SCHEMA
+
+    TEAM_ID = 1610612758
+    EVENT_CODE = 486
+
+    def ev(event_num, event_type, p1=None, p2=None):
+        return {
+            "game_id": "g1", "event_num": event_num, "period": 1,
+            "clock_seconds_left": 700.0, "event_type": event_type,
+            "event_action_type": None, "description": "test",
+            "team_id": None, "player1_id": p1, "player2_id": p2,
+            "player3_id": None, "home_score": 0, "away_score": 0,
+        }
+
+    events = [
+        ev(1, "Timeout", p1=TEAM_ID),
+        ev(2, "Timeout", p1=TEAM_ID),
+        ev(3, "Instant Replay", p1=EVENT_CODE),
+        ev(4, "Made Shot", p1=1),  # real player, must not appear in output
+    ]
+    pbp = pl.DataFrame(events, schema=PBP_SCHEMA)
+
+    leaks = audit_phantom_ids(pbp, valid_player_ids={1})
+    rows = {(r["event_type"], r["phantom_id"]): r["n"] for r in leaks.iter_rows(named=True)}
+
+    assert rows == {
+        ("Timeout", TEAM_ID): 2,
+        ("Instant Replay", EVENT_CODE): 1,
+    }

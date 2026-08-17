@@ -6,8 +6,7 @@ Base salary by season, a "Guaranteed" total, and -- critically -- the
 BBRef player slug in the last column. That slug is worth more than the
 salaries: it seeds the crosswalk directly and removes any need to fuzzy
 match ~440 names, a process that would silently merge Nikola Jokic with
-Nikola Jovic (0.92 similarity, different people) and Mouhamadou Gueye
-with Mouhamed Gueye.
+Nikola Jovic (0.92 similarity, different people).
 
 What this source does NOT give you, and why it matters
 ------------------------------------------------------

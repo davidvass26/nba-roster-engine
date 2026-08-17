@@ -83,6 +83,73 @@ def _is_sub(event_type: str | None) -> bool:
     return bool(event_type) and "substitution" in event_type.lower()
 
 
+PLAYER_ID_COLS = ("player1_id", "player2_id", "player3_id")
+
+
+def audit_phantom_ids(pbp: pl.DataFrame, valid_player_ids: set[int]) -> pl.DataFrame:
+    """Every value in a player-id slot that is NOT a real player, grouped by
+    the event_type it came from, with counts.
+
+    This is the diagnostic behind the allowlist filter (`_apply_allowlist`
+    below): the ingest-time denylist in `ingest.nba_stats` guards against
+    the THREE non-player id shapes a 400-game audit happened to find (team
+    ids, instant-replay codes, coach ids). A denylist is complete only up
+    to what has been seen; this audit is the general check, run against
+    the real player table rather than a fixed list of known bad shapes, so
+    it also catches whatever a denylist has not been taught yet.
+    """
+    if pbp.is_empty():
+        return pl.DataFrame(
+            schema={"event_type": pl.Utf8, "phantom_id": pl.Int64, "n": pl.UInt32}
+        )
+    cols = [c for c in PLAYER_ID_COLS if c in pbp.columns]
+    long = pl.concat(
+        [pbp.select(pl.col("event_type"), pl.col(c).alias("phantom_id")) for c in cols]
+    ).filter(pl.col("phantom_id").is_not_null())
+    if long.is_empty():
+        return pl.DataFrame(
+            schema={"event_type": pl.Utf8, "phantom_id": pl.Int64, "n": pl.UInt32}
+        )
+    leaks = long.filter(~pl.col("phantom_id").is_in(list(valid_player_ids)))
+    return (
+        leaks.group_by(["event_type", "phantom_id"])
+        .agg(pl.len().alias("n"))
+        .sort(["event_type", "n"], descending=[False, True])
+    )
+
+
+def _apply_allowlist(
+    pbp: pl.DataFrame, valid_player_ids: set[int] | None
+) -> pl.DataFrame:
+    """Null out any player-id-slot value that is not a real player id.
+
+    This is the allowlist rule: kept only if present in `stg.player`,
+    everything else (team ids, replay codes, coach ids, and any future
+    leak shape nobody has seen yet) becomes NULL before reconstruction
+    ever sees it. `reconstruct_game` and `_infer_period_openers` both read
+    the id columns from the frame this returns, so filtering here is a
+    single choke point that protects both opener-inference and sub
+    application regardless of what upstream parsing let through.
+
+    `valid_player_ids=None` skips filtering entirely -- synthetic test
+    games are generated with only real (synthetic) player ids by
+    construction, so there is nothing to filter and no `stg.player` table
+    to check against.
+    """
+    if valid_player_ids is None:
+        return pbp
+    cols = [c for c in PLAYER_ID_COLS if c in pbp.columns]
+    if not cols:
+        return pbp
+    valid = list(valid_player_ids)
+    return pbp.with_columns(
+        [
+            pl.when(pl.col(c).is_in(valid)).then(pl.col(c)).otherwise(None).alias(c)
+            for c in cols
+        ]
+    )
+
+
 def _elapsed_in_period(period: int, clock_seconds_left: float | None) -> float:
     """Convert 'seconds remaining in period' to 'seconds elapsed'."""
     if clock_seconds_left is None:
@@ -95,6 +162,7 @@ def reconstruct_game(
     *,
     sub_out_col: str = "player1_id",
     sub_in_col: str = "player2_id",
+    valid_player_ids: set[int] | None = None,
 ) -> ReconstructionResult:
     """Reconstruct stints for one game from its play-by-play frame.
 
@@ -102,6 +170,14 @@ def reconstruct_game(
     clock_seconds_left, event_type, player1_id (subbed OUT on a sub),
     player2_id (subbed IN on a sub), and any player id columns used to
     detect floor presence.
+
+    `valid_player_ids`, when given, is the allowlist: the set of real
+    `nba_player_id`s from `stg.player`. Any player-id-slot value not in
+    this set is treated as absent (see `_apply_allowlist`) before openers
+    are inferred or subs are applied. This is the general guard against
+    non-player ids (team ids, replay codes, coach ids, ...) landing in a
+    player slot -- pass the real player-id universe on real data; leave it
+    None for synthetic games, which have no phantom ids by construction.
 
     NB on sub direction: nba.com's convention places the outgoing player in
     the first person slot and the incoming in the second on a substitution
@@ -124,6 +200,7 @@ def reconstruct_game(
     if pbp.is_empty():
         return ReconstructionResult([], {}, ["empty play-by-play"])
 
+    pbp = _apply_allowlist(pbp, valid_player_ids)
     game_id = pbp["game_id"][0]
     stints: list[Stint] = []
     player_seconds: dict[int, float] = {}

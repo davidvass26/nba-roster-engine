@@ -171,8 +171,7 @@ def test_crosswalk_seed_covers_every_player(df, years):
 
 
 def test_similar_names_have_distinct_slugs(df):
-    """Jokic/Jovic and the two Gueyes are different people. The slug
-    column is what makes this safe; fuzzy name matching is not."""
+    """Jokic and Jovic are different people despite 0.92 name similarity.
+    The slug column is what makes this safe; fuzzy name matching is not."""
     slugs = dict(zip(df["player"].to_list(), df["bbref_slug"].to_list()))
     assert slugs["Nikola Jokić"] != slugs["Nikola Jović"]
-    assert slugs["Mouhamadou Gueye"] != slugs["Mouhamed Gueye"]

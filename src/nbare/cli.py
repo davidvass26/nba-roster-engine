@@ -515,8 +515,13 @@ def fit_rapm_cmd(
 
     Runs the full real-data chain: reconstruct stints -> split by team ->
     offense blocks -> sparse design -> ridge with grouped CV. Requires a
-    play-by-play + box-score backfill (`make pbp`) and should only be
-    trusted after `check-minutes` passes for the season.
+    play-by-play + box-score backfill (`make pbp`).
+
+    Only games that PASS the Stage 2 minutes gate are fit on -- a
+    reconstruction the gate has flagged as wrong produces stints that
+    cannot be trusted, so those games are dropped entirely rather than fit
+    on anyway. This is correct methodology, not a fallback: see
+    `rapm.blocks.blocks_from_warehouse` for the exclusion categories.
     """
     from nbare.rapm.blocks import blocks_from_warehouse
     from nbare.rapm.design import build_design
@@ -535,7 +540,7 @@ def fit_rapm_cmd(
             )
             return
         game_ids = [r[0] for r in rows]
-        console.print(f"building blocks from {len(game_ids):,} games...")
+        console.print(f"gating and building blocks from {len(game_ids):,} games...")
         blockres = blocks_from_warehouse(con, game_ids)
 
         # Attach readable names if we have them.
@@ -546,10 +551,37 @@ def fit_rapm_cmd(
             ).fetchall()
         }
 
+    excl = blockres.exclusion_summary()
+    console.print(
+        f"minutes gate: {blockres.games_total:,} games total -- "
+        f"[green]{blockres.games_included:,} included[/green], "
+        f"[red]{blockres.games_excluded:,} excluded[/red]"
+        + (
+            f", {blockres.games_missing_data:,} skipped (no pbp/box ingested)"
+            if blockres.games_missing_data
+            else ""
+        )
+    )
+    if blockres.games_excluded:
+        console.print(
+            "  excluded by category: "
+            f"data-gap={excl['data-gap']:,}  "
+            f"surname-collision={excl['surname-collision']:,}  "
+            f"isolated={excl['isolated']:,}"
+        )
+        for e in blockres.exclusions:
+            worst = max(e.offenders, key=lambda o: abs(o[1] - o[2]))
+            pid, recon_s, box_s = worst
+            console.print(
+                f"    [dim]{e.game_id} ({e.category}): worst offender "
+                f"{names.get(pid, pid)} recon={recon_s:.0f}s box={box_s:.0f}s[/dim]"
+            )
+
     if not blockres.blocks:
         console.print("[red]no usable blocks produced (check the minutes gate).")
         return
     console.print(
+        f"{blockres.stints_included:,} trusted stints -> "
         f"{len(blockres.blocks):,} blocks, {blockres.skipped_stints} stints "
         "skipped (bad team split)"
     )
@@ -562,7 +594,9 @@ def fit_rapm_cmd(
     result = fit_rapm(design)
     console.print(
         f"selected lambda: {result.best_lambda}  "
-        f"(intercept {result.intercept:.1f} pts/100)"
+        f"(intercept {result.intercept:.1f} pts/100)  "
+        f"fit on {blockres.games_included:,} games / "
+        f"{blockres.stints_included:,} stints"
     )
 
     t = Table(title=f"Top {top} by total RAPM — {season}")
@@ -577,6 +611,68 @@ def fit_rapm_cmd(
             f"{total:+.1f}", f"{off:+.1f}", f"{deff:+.1f}",
         )
     console.print(t)
+
+    for label, ratings in (("Offensive", result.offense), ("Defensive", result.defense)):
+        st = Table(title=f"Top {top} by {label} RAPM — {season}")
+        st.add_column("#", justify="right")
+        st.add_column("player")
+        st.add_column(label[:3].lower(), justify="right")
+        ranked = sorted(ratings.items(), key=lambda kv: kv[1], reverse=True)
+        for i, (pid, val) in enumerate(ranked[:top], 1):
+            st.add_row(str(i), names.get(pid, str(pid)), f"{val:+.1f}")
+        console.print(st)
+
+
+@app.command("audit-phantom-ids")
+def audit_phantom_ids_cmd(
+    season: str = typer.Option(CURRENT_SEASON),
+) -> None:
+    """Diagnostic: every player-id-slot value in stg.pbp_event that is NOT
+    a real player, grouped by event_type, with counts.
+
+    This is the general check behind the reconstruction-time allowlist --
+    run it whenever nba.com's payload shape changes, to see what non-player
+    ids are currently landing in player1_id/player2_id/player3_id, rather
+    than trusting that the ingest-time denylist has been taught every case.
+    """
+    from nbare.rapm.stints import audit_phantom_ids
+
+    with session(read_only=True) as con:
+        game_ids = [
+            r[0]
+            for r in con.execute(
+                "SELECT game_id FROM stg.game WHERE season = ?", [season]
+            ).fetchall()
+        ]
+        if not game_ids:
+            console.print(f"[yellow]no games in warehouse for {season}")
+            return
+        pbp = con.execute(
+            "SELECT * FROM stg.pbp_event WHERE game_id = ANY(?)", [game_ids]
+        ).pl()
+        valid_player_ids = {
+            r[0] for r in con.execute("SELECT nba_player_id FROM stg.player").fetchall()
+        }
+
+    leaks = audit_phantom_ids(pbp, valid_player_ids)
+    if leaks.is_empty():
+        console.print(
+            f"[green]no phantom ids in any player slot across "
+            f"{pbp.height:,} pbp events / {len(game_ids):,} games for {season}"
+        )
+        return
+
+    table = Table(title=f"phantom ids leaking into player slots -- {season}")
+    table.add_column("event_type")
+    table.add_column("phantom_id", justify="right")
+    table.add_column("count", justify="right")
+    for row in leaks.iter_rows(named=True):
+        table.add_row(str(row["event_type"]), str(row["phantom_id"]), str(row["n"]))
+    console.print(table)
+    console.print(
+        f"[red]{leaks.height} distinct (event_type, phantom_id) pairs, "
+        f"{leaks['n'].sum():,} rows total"
+    )
 
 
 @app.command("check-minutes")
@@ -630,6 +726,10 @@ def check_minutes_cmd(
             )
             return
 
+        valid_player_ids = {
+            r[0] for r in con.execute("SELECT nba_player_id FROM stg.player").fetchall()
+        }
+
         passed = failed = 0
         for (gid,) in games:
             pbp = con.execute(
@@ -640,7 +740,7 @@ def check_minutes_cmd(
             ).pl()
             if pbp.is_empty() or box.is_empty():
                 continue
-            res = reconstruct_game(pbp)
+            res = reconstruct_game(pbp, valid_player_ids=valid_player_ids)
             chk = validate_minutes(res, box)
             if chk.passed:
                 passed += 1
