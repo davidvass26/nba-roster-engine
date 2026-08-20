@@ -1,0 +1,16 @@
+# Streamlit Community Cloud installs this from the repo root (cwd = repo
+# root, per Streamlit's deploy convention), so `-e .` resolves to the
+# top-level pyproject.toml and installs the `nbare` package plus its core
+# dependencies (duckdb, polars, pydantic, typer, rich, numpy, scipy,
+# scikit-learn, etc).
+#
+# Deliberately NOT installing the `[model]` extra (numpyro, arviz): the app
+# never imports nbare.projection or nbare.rapm at runtime -- RAPM and
+# projections are precomputed offline by `nbare export-app-data` into
+# app/data/*, and the app only reads those files plus the live contract
+# CSV. If a change to this file (or to streamlit_app.py's imports) pulls
+# numpyro/jax into the install, that's a bug -- see docs/app_spec.md's
+# "Deployment" section.
+streamlit>=1.36
+altair>=5.0
+-e .
