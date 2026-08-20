@@ -17,6 +17,7 @@ from nbare.rapm.blocks import (
     blocks_for_game,
     blocks_from_warehouse,
     classify_gate_failure,
+    merge_warehouse_results,
     player_team_map,
     split_lineup,
 )
@@ -222,3 +223,42 @@ def test_blocks_from_warehouse_excludes_gate_failing_games(tmp_path):
     # None of the excluded game's blocks leak into the trusted output.
     assert result.blocks
     assert all(b.game_id == "g_good" for b in result.blocks)
+
+
+# --- pooled multi-season merging ------------------------------------------
+
+def test_merge_warehouse_results_pools_across_seasons():
+    """The core of pooled multi-season RAPM: merging two seasons'
+    WarehouseBlockResults must sum every count and concatenate blocks, and
+    a player appearing in both must end up as ONE design-matrix column
+    (one pooled rating), not split per season."""
+    from nbare.rapm.blocks import WarehouseBlockResult
+
+    season_a = make_scoring_game(game_id="sa1", seed=1)
+    season_b = make_scoring_game(game_id="sb1", seed=2)
+
+    def to_result(game):
+        recon = reconstruct_game(game.pbp)
+        box = scoring_box_frame(game)
+        res = blocks_for_game(game.pbp, recon.stints, player_team_map(box))
+        return WarehouseBlockResult(
+            blocks=res.blocks, skipped_stints=res.skipped_stints,
+            warnings=res.warnings, games_total=1, games_included=1,
+            games_missing_data=0, stints_included=len(recon.stints),
+            exclusions=[],
+        )
+
+    ra, rb = to_result(season_a), to_result(season_b)
+    merged = merge_warehouse_results([ra, rb])
+
+    assert merged.games_total == 2
+    assert merged.games_included == 2
+    assert merged.stints_included == ra.stints_included + rb.stints_included
+    assert len(merged.blocks) == len(ra.blocks) + len(rb.blocks)
+
+    # Player 1 (a fixed synthetic id) appears in both games -- pooling must
+    # give him ONE column, not two.
+    design = build_design(merged.blocks)
+    assert 1 in design.player_index
+    all_ids = {pid for b in merged.blocks for pid in (*b.offense, *b.defense)}
+    assert design.n_players == len(all_ids)

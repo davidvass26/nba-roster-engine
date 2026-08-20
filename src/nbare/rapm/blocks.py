@@ -87,6 +87,34 @@ class WarehouseBlockResult:
         return len(self.exclusions)
 
 
+def merge_warehouse_results(
+    results: list[WarehouseBlockResult],
+) -> WarehouseBlockResult:
+    """Combine per-season gate-filtered results into one pooled result.
+
+    This is the whole mechanism behind pooled multi-season RAPM: nba.com
+    game_ids already encode season (verified against `stg.game`'s PRIMARY
+    KEY, which forbids a game_id from appearing in two seasons), so a
+    player_id is the same column in the design matrix regardless of which
+    season's blocks it came from -- concatenating blocks lists here IS the
+    pooling. No player/season split happens anywhere in this pipeline; that
+    is what makes this the plain pooled baseline rather than an aging-aware
+    model. Each input result should come from its own `blocks_from_warehouse`
+    call (one per season) so the gate and exclusion categorization are
+    still reported per season before pooling.
+    """
+    return WarehouseBlockResult(
+        blocks=[b for r in results for b in r.blocks],
+        skipped_stints=sum(r.skipped_stints for r in results),
+        warnings=[w for r in results for w in r.warnings],
+        games_total=sum(r.games_total for r in results),
+        games_included=sum(r.games_included for r in results),
+        games_missing_data=sum(r.games_missing_data for r in results),
+        stints_included=sum(r.stints_included for r in results),
+        exclusions=[e for r in results for e in r.exclusions],
+    )
+
+
 def player_team_map(box: pl.DataFrame, *, player_col: str = "nba_player_id",
                     team_col: str = "nba_team_id") -> dict[int, int]:
     """player_id -> team_id, from the box score."""

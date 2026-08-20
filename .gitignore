@@ -1,9 +1,9 @@
-data/
-!data/.gitkeep
+/data/*
+!/data/.gitkeep
+!/data/raw/
 __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
 .venv/
-!data/raw/

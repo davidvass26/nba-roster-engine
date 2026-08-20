@@ -42,6 +42,71 @@ DEFAULT_LAMBDA_GRID: tuple[float, ...] = (
     100.0, 300.0, 1000.0, 2000.0, 3000.0, 5000.0, 8000.0, 15000.0, 30000.0,
 )
 
+# Replacement level: the RAPM rating of a readily-replaceable player (a
+# min-salary free agent / end-of-bench call-up) -- the baseline "value"
+# measures ABOVE. -2.0 is BPM's published replacement-level convention; we
+# default half a point lower as a starting point, since this is a
+# possession-weighted ridge fit on lineup data, not a box-score regression,
+# and its shrinkage/variance behavior is not the same as BPM's. This has
+# NOT been empirically calibrated against this project's own fits (e.g. by
+# checking where confirmed replacement-level players actually land in a
+# real fit's rating distribution) -- it is a configurable placeholder, not
+# a derived constant. Override via `compute_value`'s `replacement_level`
+# argument once real calibration is done.
+REPLACEMENT_LEVEL: float = -2.5
+
+# Points-per-win: the standard sabermetrics-style conversion (also used by
+# box-score value metrics like VORP) treating ~30 points of value over a
+# season as worth one added win. Same caveat as REPLACEMENT_LEVEL: a
+# borrowed convention, not calibrated against this RAPM's own scale.
+POINTS_PER_WIN: float = 30.0
+
+
+def _player_possessions(design: DesignMatrix) -> dict[int, float]:
+    """Total possessions each player was on the floor for: the sum of
+    block possession weights (`design.w`) over every design row where
+    they appear, offense or defense combined. Reads directly off the same
+    design matrix the ridge fit on -- not a fresh pass over blocks -- so
+    this can never disagree with what the model actually saw.
+    """
+    Xc = design.X.tocsc()
+    poss: dict[int, float] = {}
+    for pid, i in design.player_index.items():
+        off_rows = Xc.getcol(2 * i).indices
+        def_rows = Xc.getcol(2 * i + 1).indices
+        poss[pid] = float(design.w[off_rows].sum() + design.w[def_rows].sum())
+    return poss
+
+
+def compute_value(
+    design: DesignMatrix,
+    offense: dict[int, float],
+    defense: dict[int, float],
+    replacement_level: float = REPLACEMENT_LEVEL,
+) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
+    """Post-fit value metric. Returns (possessions, value, wins_added).
+
+        value = (total_rapm - replacement_level) * possessions / 100
+        wins_added = value / POINTS_PER_WIN
+
+    This turns the RATE stat (RAPM, points per 100 possessions) into a
+    VOLUME stat by multiplying by playing time -- the same rate-times-
+    exposure idea as win shares or BPM*minutes. It is computed strictly
+    from already-fitted ratings and the design matrix's own possession
+    weights; nothing here feeds back into or changes the ridge
+    coefficients.
+    """
+    possessions = _player_possessions(design)
+    value: dict[int, float] = {}
+    wins_added: dict[int, float] = {}
+    for pid in offense:
+        total = offense[pid] + defense.get(pid, 0.0)
+        poss = possessions.get(pid, 0.0)
+        v = (total - replacement_level) * poss / 100.0
+        value[pid] = v
+        wins_added[pid] = v / POINTS_PER_WIN
+    return possessions, value, wins_added
+
 
 @dataclass
 class RAPMResult:
@@ -52,6 +117,10 @@ class RAPMResult:
     cv_scores: dict[float, float]  # lambda -> mean held-out weighted MSE
     n_rows: int
     n_players: int
+    possessions: dict[int, float]  # player_id -> total possessions (off + def)
+    value: dict[int, float]        # player_id -> (total - replacement) * poss/100
+    wins_added: dict[int, float]   # player_id -> value / POINTS_PER_WIN
+    replacement_level: float       # the replacement_level value used above
 
     def total(self, player_id: int) -> float:
         """Combined RAPM: offense plus defense (both in 'good is positive')."""
@@ -62,6 +131,21 @@ class RAPMResult:
         rows = [
             (pid, self.total(pid), self.offense.get(pid, 0.0),
              self.defense.get(pid, 0.0))
+            for pid in self.offense
+        ]
+        rows.sort(key=lambda t: t[1], reverse=True)
+        return rows
+
+    def value_ranking(self) -> list[tuple[int, float, float, float, float]]:
+        """(player_id, value, wins_added, total_rapm, possessions) sorted
+        by value, best first. A rate leaderboard (`ranking`) and this
+        volume leaderboard answer different questions -- a high-rate
+        low-minutes player can rank above a compiler-type on `ranking`
+        while ranking well below him here, and that is the point of
+        having both."""
+        rows = [
+            (pid, self.value.get(pid, 0.0), self.wins_added.get(pid, 0.0),
+             self.total(pid), self.possessions.get(pid, 0.0))
             for pid in self.offense
         ]
         rows.sort(key=lambda t: t[1], reverse=True)
@@ -115,11 +199,17 @@ def fit_rapm(
     lambda_grid: tuple[float, ...] = DEFAULT_LAMBDA_GRID,
     n_splits: int = 5,
     fixed_lambda: float | None = None,
+    replacement_level: float = REPLACEMENT_LEVEL,
 ) -> RAPMResult:
     """Fit ridge RAPM, choosing lambda by grouped CV unless one is fixed.
 
     `fixed_lambda` skips CV -- useful for teaching/debugging the mechanics
     before trusting the CV wrapper, and for fast synthetic recovery checks.
+
+    The ridge fit itself only ever touches offense/defense; `value` and
+    `wins_added` are computed strictly AFTER, from the fitted ratings plus
+    possession weights already in `design` -- they cannot influence the
+    coefficients above.
     """
     if fixed_lambda is not None:
         best_lambda, cv_scores = fixed_lambda, {fixed_lambda: float("nan")}
@@ -139,6 +229,9 @@ def fit_rapm(
         # positive coefficient already. Keep the raw sign.
         defense[pid] = float(coef[2 * i + 1])
 
+    possessions, value, wins_added = compute_value(
+        design, offense, defense, replacement_level
+    )
     return RAPMResult(
         offense=offense,
         defense=defense,
@@ -147,6 +240,10 @@ def fit_rapm(
         cv_scores=cv_scores,
         n_rows=design.X.shape[0],
         n_players=design.n_players,
+        possessions=possessions,
+        value=value,
+        wins_added=wins_added,
+        replacement_level=replacement_level,
     )
 
 
@@ -156,6 +253,7 @@ def fit_rapm_bayesian(
     lambda_grid: tuple[float, ...] = DEFAULT_LAMBDA_GRID,
     n_splits: int = 5,
     fixed_lambda: float | None = None,
+    replacement_level: float = REPLACEMENT_LEVEL,
 ) -> RAPMResult:
     """Fit RAPM shrinking toward a box-score prior mean instead of zero.
 
@@ -200,6 +298,9 @@ def fit_rapm_bayesian(
         offense[pid] = float(coef[2 * i])
         defense[pid] = float(coef[2 * i + 1])
 
+    possessions, value, wins_added = compute_value(
+        design, offense, defense, replacement_level
+    )
     return RAPMResult(
         offense=offense,
         defense=defense,
@@ -208,6 +309,10 @@ def fit_rapm_bayesian(
         cv_scores=cv_scores,
         n_rows=design.X.shape[0],
         n_players=design.n_players,
+        possessions=possessions,
+        value=value,
+        wins_added=wins_added,
+        replacement_level=replacement_level,
     )
 
 

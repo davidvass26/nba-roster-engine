@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import typer
+from rich.columns import Columns
 from rich.console import Console
 from rich.table import Table
 
@@ -504,56 +506,10 @@ def apply_overrides_cmd(
                 for r in roster.select("player", "cap_hit").iter_rows(named=True):
                     console.print(f"  {r['player']:28s} ${r['cap_hit']:>12,}")
 
-@app.command("fit-rapm")
-def fit_rapm_cmd(
-    season: str = typer.Option(CURRENT_SEASON),
-    limit: int = typer.Option(0, help="cap games (0 = all in season)"),
-    min_possessions: float = typer.Option(1.0, help="drop tiny blocks"),
-    top: int = typer.Option(25, help="print this many top players"),
-) -> None:
-    """Fit offense/defense RAPM from the warehouse for a season.
-
-    Runs the full real-data chain: reconstruct stints -> split by team ->
-    offense blocks -> sparse design -> ridge with grouped CV. Requires a
-    play-by-play + box-score backfill (`make pbp`).
-
-    Only games that PASS the Stage 2 minutes gate are fit on -- a
-    reconstruction the gate has flagged as wrong produces stints that
-    cannot be trusted, so those games are dropped entirely rather than fit
-    on anyway. This is correct methodology, not a fallback: see
-    `rapm.blocks.blocks_from_warehouse` for the exclusion categories.
-    """
-    from nbare.rapm.blocks import blocks_from_warehouse
-    from nbare.rapm.design import build_design
-    from nbare.rapm.fit import fit_rapm
-
-    with session() as con:
-        rows = con.execute(
-            "SELECT game_id FROM stg.game WHERE season = ? ORDER BY game_date"
-            + (f" LIMIT {limit}" if limit else ""),
-            [season],
-        ).fetchall()
-        if not rows:
-            console.print(
-                "[yellow]no games in warehouse for that season. Run "
-                "`make games`/`make pbp` first."
-            )
-            return
-        game_ids = [r[0] for r in rows]
-        console.print(f"gating and building blocks from {len(game_ids):,} games...")
-        blockres = blocks_from_warehouse(con, game_ids)
-
-        # Attach readable names if we have them.
-        names = {
-            r[0]: r[1]
-            for r in con.execute(
-                "SELECT nba_player_id, full_name FROM stg.player"
-            ).fetchall()
-        }
-
+def _print_gate_summary(label: str, blockres, names: dict) -> None:
     excl = blockres.exclusion_summary()
     console.print(
-        f"minutes gate: {blockres.games_total:,} games total -- "
+        f"[bold]{label}[/bold] minutes gate: {blockres.games_total:,} games total -- "
         f"[green]{blockres.games_included:,} included[/green], "
         f"[red]{blockres.games_excluded:,} excluded[/red]"
         + (
@@ -577,6 +533,89 @@ def fit_rapm_cmd(
                 f"{names.get(pid, pid)} recon={recon_s:.0f}s box={box_s:.0f}s[/dim]"
             )
 
+
+@app.command("fit-rapm")
+def fit_rapm_cmd(
+    season: str = typer.Option(CURRENT_SEASON),
+    seasons: str = typer.Option(
+        None,
+        help="comma-separated seasons for a POOLED multi-season fit, e.g. "
+        "2023-24,2024-25,2025-26 (overrides --season; one rating per "
+        "player pooled across all listed seasons, not a per-season split)",
+    ),
+    limit: int = typer.Option(0, help="cap games per season (0 = all)"),
+    min_possessions: float = typer.Option(1.0, help="drop tiny blocks"),
+    top: int = typer.Option(25, help="print this many top players"),
+    replacement_level: float = typer.Option(
+        None,
+        help="RAPM rating (pts/100) of a replacement-level player, used as "
+        "the baseline for the value/wins-added leaderboard "
+        "(default: nbare.rapm.fit.REPLACEMENT_LEVEL)",
+    ),
+) -> None:
+    """Fit offense/defense RAPM from the warehouse for one or more seasons.
+
+    Runs the full real-data chain: reconstruct stints -> split by team ->
+    offense blocks -> sparse design -> ridge with grouped CV. Requires a
+    play-by-play + box-score backfill (`make pbp`).
+
+    Only games that PASS the Stage 2 minutes gate are fit on, in EVERY
+    season -- a reconstruction the gate has flagged as wrong produces
+    stints that cannot be trusted, so those games are dropped entirely
+    rather than fit on anyway. This is correct methodology, not a
+    fallback: see `rapm.blocks.blocks_from_warehouse` for the exclusion
+    categories.
+
+    With --seasons, each season is gated and reported separately, then
+    pooled: a player who appears in multiple seasons gets ONE column (one
+    rating), with stints from every season stacked as rows. Grouped CV
+    still groups by game_id -- nba.com game_ids already encode season, so
+    there is no cross-season leakage concern.
+    """
+    from nbare.rapm.blocks import blocks_from_warehouse, merge_warehouse_results
+    from nbare.rapm.design import build_design
+    from nbare.rapm.fit import REPLACEMENT_LEVEL, fit_rapm
+
+    if replacement_level is None:
+        replacement_level = REPLACEMENT_LEVEL
+
+    season_list = [s.strip() for s in seasons.split(",")] if seasons else [season]
+    label = "+".join(season_list)
+
+    per_season_results = []
+    with session() as con:
+        names = {
+            r[0]: r[1]
+            for r in con.execute(
+                "SELECT nba_player_id, full_name FROM stg.player"
+            ).fetchall()
+        }
+        for s in season_list:
+            rows = con.execute(
+                "SELECT game_id FROM stg.game WHERE season = ? ORDER BY game_date"
+                + (f" LIMIT {limit}" if limit else ""),
+                [s],
+            ).fetchall()
+            if not rows:
+                console.print(
+                    f"[yellow]no games in warehouse for {s}, skipping. Run "
+                    "`make games`/`make pbp` first."
+                )
+                continue
+            game_ids = [r[0] for r in rows]
+            console.print(f"[{s}] gating and building blocks from {len(game_ids):,} games...")
+            res = blocks_from_warehouse(con, game_ids)
+            _print_gate_summary(s, res, names)
+            per_season_results.append(res)
+
+    if not per_season_results:
+        console.print("[red]no seasons produced usable data.")
+        return
+
+    blockres = merge_warehouse_results(per_season_results)
+    if len(season_list) > 1:
+        _print_gate_summary("pooled", blockres, names)
+
     if not blockres.blocks:
         console.print("[red]no usable blocks produced (check the minutes gate).")
         return
@@ -591,36 +630,165 @@ def fit_rapm_cmd(
         f"design: {design.X.shape[0]:,} rows x {design.X.shape[1]:,} cols; "
         "fitting with grouped CV..."
     )
-    result = fit_rapm(design)
+    result = fit_rapm(design, replacement_level=replacement_level)
     console.print(
         f"selected lambda: {result.best_lambda}  "
         f"(intercept {result.intercept:.1f} pts/100)  "
         f"fit on {blockres.games_included:,} games / "
         f"{blockres.stints_included:,} stints"
     )
+    console.print(
+        f"value baseline: replacement_level={result.replacement_level:+.1f} "
+        "pts/100, wins_added = value / 30"
+    )
 
-    t = Table(title=f"Top {top} by total RAPM — {season}")
-    t.add_column("#", justify="right")
-    t.add_column("player")
-    t.add_column("total", justify="right")
-    t.add_column("off", justify="right")
-    t.add_column("def", justify="right")
+    rate_t = Table(title=f"Top {top} by total RAPM (rate) — {label}")
+    rate_t.add_column("#", justify="right")
+    rate_t.add_column("player")
+    rate_t.add_column("total", justify="right")
+    rate_t.add_column("off", justify="right")
+    rate_t.add_column("def", justify="right")
     for i, (pid, total, off, deff) in enumerate(result.ranking()[:top], 1):
-        t.add_row(
+        rate_t.add_row(
             str(i), names.get(pid, str(pid)),
             f"{total:+.1f}", f"{off:+.1f}", f"{deff:+.1f}",
         )
-    console.print(t)
 
-    for label, ratings in (("Offensive", result.offense), ("Defensive", result.defense)):
-        st = Table(title=f"Top {top} by {label} RAPM — {season}")
+    value_t = Table(title=f"Top {top} by Value (volume) — {label}")
+    value_t.add_column("#", justify="right")
+    value_t.add_column("player")
+    value_t.add_column("value", justify="right")
+    value_t.add_column("wins+", justify="right")
+    value_t.add_column("poss", justify="right")
+    for i, (pid, value, wins, total, poss) in enumerate(result.value_ranking()[:top], 1):
+        value_t.add_row(
+            str(i), names.get(pid, str(pid)),
+            f"{value:+.0f}", f"{wins:+.1f}", f"{poss:,.0f}",
+        )
+
+    console.print(Columns([rate_t, value_t]))
+
+    for side, ratings in (("Offensive", result.offense), ("Defensive", result.defense)):
+        st = Table(title=f"Top {top} by {side} RAPM — {label}")
         st.add_column("#", justify="right")
         st.add_column("player")
-        st.add_column(label[:3].lower(), justify="right")
+        st.add_column(side[:3].lower(), justify="right")
         ranked = sorted(ratings.items(), key=lambda kv: kv[1], reverse=True)
         for i, (pid, val) in enumerate(ranked[:top], 1):
             st.add_row(str(i), names.get(pid, str(pid)), f"{val:+.1f}")
         console.print(st)
+
+
+@app.command("export-app-data")
+def export_app_data_cmd(
+    seasons: str = typer.Option(
+        "2023-24,2024-25,2025-26",
+        help="comma-separated seasons for the pooled fit exported to the app",
+    ),
+    replacement_level: float = typer.Option(
+        None,
+        help="RAPM rating (pts/100) of a replacement-level player "
+        "(default: nbare.rapm.fit.REPLACEMENT_LEVEL)",
+    ),
+    out_dir: str = typer.Option("app/data", help="output directory"),
+) -> None:
+    """Export precomputed results for the deployed app: it has no DuckDB
+    warehouse or nba.com cache in the cloud, so it reads only these files
+    plus the live contract CSV. See docs/export_results_spec.md.
+
+    Computes NOTHING new -- runs the exact same pooled multi-season fit
+    path as `fit-rapm --seasons ...` (rapm.blocks -> rapm.design ->
+    rapm.fit) and serializes the result. `projections.csv` is written as
+    a header-only stub for now (see meta.json's `projections_status`):
+    no real-data Stage 3 projections pipeline has been built yet, and
+    faking rows would violate CLAUDE.md's honesty rule.
+    """
+    from nbare.export import (
+        RAPM_LEADERBOARD_COLUMNS,
+        build_meta,
+        rapm_leaderboard_rows,
+        write_csv,
+        write_meta_json,
+        write_projections_stub,
+    )
+    from nbare.rapm.blocks import blocks_from_warehouse, merge_warehouse_results
+    from nbare.rapm.design import build_design
+    from nbare.rapm.fit import POINTS_PER_WIN, REPLACEMENT_LEVEL, fit_rapm
+
+    if replacement_level is None:
+        replacement_level = REPLACEMENT_LEVEL
+
+    season_list = [s.strip() for s in seasons.split(",")]
+
+    per_season_results = []
+    with session() as con:
+        names = {
+            r[0]: r[1]
+            for r in con.execute(
+                "SELECT nba_player_id, full_name FROM stg.player"
+            ).fetchall()
+        }
+        for s in season_list:
+            rows = con.execute(
+                "SELECT game_id FROM stg.game WHERE season = ? ORDER BY game_date",
+                [s],
+            ).fetchall()
+            if not rows:
+                console.print(f"[yellow]no games in warehouse for {s}, skipping")
+                continue
+            game_ids = [r[0] for r in rows]
+            console.print(f"[{s}] gating and building blocks from {len(game_ids):,} games...")
+            per_season_results.append(blocks_from_warehouse(con, game_ids))
+
+    if not per_season_results:
+        console.print("[red]no seasons produced usable data; nothing exported.")
+        raise typer.Exit(1)
+
+    blockres = merge_warehouse_results(per_season_results)
+    if not blockres.blocks:
+        console.print("[red]no usable blocks produced; nothing exported.")
+        raise typer.Exit(1)
+
+    design = build_design(blockres.blocks)
+    console.print(
+        f"design: {design.X.shape[0]:,} rows x {design.X.shape[1]:,} cols; "
+        "fitting with grouped CV..."
+    )
+    result = fit_rapm(design, replacement_level=replacement_level)
+    console.print(
+        f"selected lambda: {result.best_lambda}  fit on "
+        f"{blockres.games_included:,} games / {blockres.stints_included:,} stints"
+    )
+
+    out = Path(out_dir)
+
+    leaderboard_rows = rapm_leaderboard_rows(result, names)
+    dropped = len(result.offense) - len(leaderboard_rows)
+    write_csv(leaderboard_rows, RAPM_LEADERBOARD_COLUMNS, out / "rapm_leaderboard.csv")
+    console.print(
+        f"[green]wrote {out / 'rapm_leaderboard.csv'} "
+        f"({len(leaderboard_rows):,} rows)"
+        + (f"  [yellow]({dropped} player id(s) dropped: no name in stg.player)"
+           if dropped else "")
+    )
+
+    write_projections_stub(out / "projections.csv")
+    console.print(
+        f"[yellow]wrote {out / 'projections.csv'} (0 rows -- real-data "
+        "projections pipeline not yet built; see meta.json)"
+    )
+
+    meta = build_meta(
+        seasons_used=season_list,
+        n_games=blockres.games_included,
+        n_stints=blockres.stints_included,
+        lambda_=result.best_lambda,
+        replacement_level=result.replacement_level,
+        points_per_win=POINTS_PER_WIN,
+        fit_type="pooled multi-season ridge RAPM (zero-mean prior)",
+    )
+    write_meta_json(meta, out / "meta.json")
+    console.print(f"[green]wrote {out / 'meta.json'}")
 
 
 @app.command("audit-phantom-ids")

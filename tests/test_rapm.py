@@ -13,7 +13,13 @@ import numpy as np
 import pytest
 
 from nbare.rapm.design import OffenseBlock, build_design
-from nbare.rapm.fit import fit_rapm, select_lambda
+from nbare.rapm.fit import (
+    POINTS_PER_WIN,
+    REPLACEMENT_LEVEL,
+    compute_value,
+    fit_rapm,
+    select_lambda,
+)
 from nbare.rapm.possessions import estimate_team_possessions
 
 
@@ -155,3 +161,93 @@ def test_cv_folds_do_not_split_a_game():
     design = build_design(_simulate(n, 30, to, td, 4))
     best, scores = select_lambda(design, n_splits=5)
     assert best in scores
+
+
+# --- post-fit value metric -------------------------------------------------
+# compute_value is tested directly against hand-picked ratings, not ratings
+# from an actual ridge fit: the formula is deterministic given (rating,
+# possessions), so there is nothing a fit's estimation noise would add here
+# -- and testing it directly is what lets possessions be pinned to exact,
+# known numbers via minimal single-player OffenseBlocks (build_design does
+# not require 5-and-5 lineups; that check lives upstream in split_lineup).
+
+def test_compute_value_scales_with_rating_and_possessions():
+    A, B, C, OPP = 1, 2, 3, 99
+    blocks = [
+        # A: 100 possessions total (60 offense + 40 defense).
+        OffenseBlock("g1", frozenset({A}), frozenset({OPP}), 0.0, 60.0),
+        OffenseBlock("g1", frozenset({OPP}), frozenset({A}), 0.0, 40.0),
+        # B: same rating as A, but DOUBLE the possessions.
+        OffenseBlock("g2", frozenset({B}), frozenset({OPP}), 0.0, 120.0),
+        OffenseBlock("g2", frozenset({OPP}), frozenset({B}), 0.0, 80.0),
+        # C: same possessions as A, but a different rating.
+        OffenseBlock("g3", frozenset({C}), frozenset({OPP}), 0.0, 60.0),
+        OffenseBlock("g3", frozenset({OPP}), frozenset({C}), 0.0, 40.0),
+    ]
+    design = build_design(blocks)
+
+    offense = {A: 3.0, B: 3.0, C: 6.0, OPP: 0.0}
+    defense = {A: 0.0, B: 0.0, C: 0.0, OPP: 0.0}
+    possessions, value, wins_added = compute_value(design, offense, defense)
+
+    assert possessions[A] == pytest.approx(100.0)
+    assert possessions[B] == pytest.approx(200.0)
+    assert possessions[C] == pytest.approx(100.0)
+
+    assert value[A] == pytest.approx((3.0 - REPLACEMENT_LEVEL) * 100 / 100)
+    assert value[B] == pytest.approx((3.0 - REPLACEMENT_LEVEL) * 200 / 100)
+    assert value[C] == pytest.approx((6.0 - REPLACEMENT_LEVEL) * 100 / 100)
+
+    # Same rating, double the possessions -> exactly double the value.
+    assert value[B] == pytest.approx(2 * value[A])
+    # Same possessions, higher rating -> proportionally higher value.
+    assert value[C] / value[A] == pytest.approx(
+        (6.0 - REPLACEMENT_LEVEL) / (3.0 - REPLACEMENT_LEVEL)
+    )
+
+    assert wins_added[A] == pytest.approx(value[A] / POINTS_PER_WIN)
+    assert wins_added[B] == pytest.approx(value[B] / POINTS_PER_WIN)
+
+
+def test_compute_value_is_zero_at_replacement_level():
+    """A player rated exactly at replacement level gets value 0 -- and
+    stays 0 no matter how many possessions he plays, since it is the RATE
+    relative to replacement that must be zero, not the volume."""
+    D, OPP = 4, 99
+    blocks = [
+        OffenseBlock("g1", frozenset({D}), frozenset({OPP}), 0.0, 300.0),
+        OffenseBlock("g1", frozenset({OPP}), frozenset({D}), 0.0, 300.0),
+    ]
+    design = build_design(blocks)
+
+    offense = {D: REPLACEMENT_LEVEL, OPP: 0.0}
+    defense = {D: 0.0, OPP: 0.0}
+    possessions, value, wins_added = compute_value(design, offense, defense)
+
+    assert possessions[D] == pytest.approx(600.0)  # plenty of playing time
+    assert value[D] == pytest.approx(0.0, abs=1e-9)
+    assert wins_added[D] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_fit_rapm_populates_value_fields():
+    """End-to-end: fit_rapm's RAPMResult carries possessions/value/
+    wins_added consistent with compute_value, not just offense/defense."""
+    rng = np.random.default_rng(7)
+    n = 15
+    to = {p: float(rng.normal(0, 3)) for p in range(n)}
+    td = {p: float(rng.normal(0, 3)) for p in range(n)}
+    design = build_design(_simulate(n, 200, to, td, 7))
+
+    res = fit_rapm(design, fixed_lambda=1000.0)
+    _, expected_value, expected_wins = compute_value(
+        design, res.offense, res.defense, REPLACEMENT_LEVEL
+    )
+
+    assert res.replacement_level == REPLACEMENT_LEVEL
+    for pid in res.offense:
+        assert res.value[pid] == pytest.approx(expected_value[pid])
+        assert res.wins_added[pid] == pytest.approx(expected_wins[pid])
+
+    ranked = res.value_ranking()
+    values = [v for _, v, *_ in ranked]
+    assert values == sorted(values, reverse=True)
