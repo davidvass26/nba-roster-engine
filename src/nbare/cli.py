@@ -506,6 +506,65 @@ def apply_overrides_cmd(
                 for r in roster.select("player", "cap_hit").iter_rows(named=True):
                     console.print(f"  {r['player']:28s} ${r['cap_hit']:>12,}")
 
+PRIOR_CHOICES = ("box", "zero")
+
+
+def _fit_with_prior(design, prior: str, game_ids: list[str], replacement_level: float):
+    """Fit RAPM with the chosen prior; returns (RAPMResult, fit_type label).
+
+    "zero": plain ridge, every player shrunk toward league average.
+    "box":  the two-stage box-score prior (rapm/prior.py): a plain-ridge fit
+            supplies training labels for a box-score -> rating regression on
+            players with enough possessions; its predictions become the prior
+            mean mu, and `fit_rapm_bayesian` shrinks toward mu instead of 0.
+            Box features come from the CACHE ONLY (never fetched here) for
+            every game in `game_ids`; missing games are reported.
+
+    The returned label is what goes into meta.json's `fit_type`, so the app
+    can never claim a prior the fit did not use.
+    """
+    from nbare.rapm.fit import fit_rapm, fit_rapm_bayesian, player_side_possessions
+
+    if prior not in PRIOR_CHOICES:
+        raise typer.BadParameter(f"--prior must be one of {PRIOR_CHOICES}, got {prior!r}")
+
+    plain = fit_rapm(design, replacement_level=replacement_level)
+    if prior == "zero":
+        return plain, "pooled multi-season ridge RAPM (zero-mean prior)"
+
+    from nbare.ingest.nba_stats import box_detail_from_cache
+    from nbare.rapm.box_features import box_score_rows
+    from nbare.rapm.prior import build_prior
+
+    console.print(
+        f"plain-ridge stage: lambda {plain.best_lambda}; building box-score prior "
+        f"from cached box scores for {len(game_ids):,} games..."
+    )
+    detail, missing = box_detail_from_cache(game_ids)
+    if missing:
+        console.print(
+            f"[yellow]{len(missing):,} game(s) have no cached box score and are "
+            "left out of the prior features (run `make box SEASON=...`)"
+        )
+    feats = box_score_rows(detail, player_side_possessions(design))
+    pm = build_prior(design, plain, feats.rows)
+    console.print(
+        f"prior: {len(feats.rows):,} players with box features "
+        f"({feats.n_below_min:,} below the box-possession minimum -> zero prior; "
+        f"{feats.n_position_unknown:,} with no labeled starts -> position_big=0); "
+        f"trained on {pm.reliable_offense:,} off / {pm.reliable_defense:,} def "
+        "reliable players"
+    )
+    for side, model in (("off", pm.offense_model), ("def", pm.defense_model)):
+        coefs = ", ".join(f"{f}={c:+.2f}" for f, c in zip(model.features, model.coef))
+        console.print(f"  {side} prior (standardized): {coefs}")
+    for note in pm.notes:
+        console.print(f"[yellow]  prior note: {note}")
+
+    result = fit_rapm_bayesian(design, pm.mu, replacement_level=replacement_level)
+    return result, "pooled multi-season ridge RAPM with box-score prior"
+
+
 def _print_gate_summary(label: str, blockres, names: dict) -> None:
     excl = blockres.exclusion_summary()
     console.print(
@@ -552,6 +611,11 @@ def fit_rapm_cmd(
         "the baseline for the value/wins-added leaderboard "
         "(default: nbare.rapm.fit.REPLACEMENT_LEVEL)",
     ),
+    prior: str = typer.Option(
+        "box",
+        help="shrinkage target: 'box' (box-score-informed prior mean) or "
+        "'zero' (plain ridge, shrink to league average)",
+    ),
 ) -> None:
     """Fit offense/defense RAPM from the warehouse for one or more seasons.
 
@@ -574,7 +638,7 @@ def fit_rapm_cmd(
     """
     from nbare.rapm.blocks import blocks_from_warehouse, merge_warehouse_results
     from nbare.rapm.design import build_design
-    from nbare.rapm.fit import REPLACEMENT_LEVEL, fit_rapm
+    from nbare.rapm.fit import REPLACEMENT_LEVEL
 
     if replacement_level is None:
         replacement_level = REPLACEMENT_LEVEL
@@ -583,6 +647,7 @@ def fit_rapm_cmd(
     label = "+".join(season_list)
 
     per_season_results = []
+    all_game_ids: list[str] = []
     with session() as con:
         names = {
             r[0]: r[1]
@@ -603,6 +668,7 @@ def fit_rapm_cmd(
                 )
                 continue
             game_ids = [r[0] for r in rows]
+            all_game_ids.extend(game_ids)
             console.print(f"[{s}] gating and building blocks from {len(game_ids):,} games...")
             res = blocks_from_warehouse(con, game_ids)
             _print_gate_summary(s, res, names)
@@ -630,7 +696,8 @@ def fit_rapm_cmd(
         f"design: {design.X.shape[0]:,} rows x {design.X.shape[1]:,} cols; "
         "fitting with grouped CV..."
     )
-    result = fit_rapm(design, replacement_level=replacement_level)
+    result, fit_type = _fit_with_prior(design, prior, all_game_ids, replacement_level)
+    console.print(f"fit: {fit_type}")
     console.print(
         f"selected lambda: {result.best_lambda}  "
         f"(intercept {result.intercept:.1f} pts/100)  "
@@ -690,6 +757,11 @@ def export_app_data_cmd(
         help="RAPM rating (pts/100) of a replacement-level player "
         "(default: nbare.rapm.fit.REPLACEMENT_LEVEL)",
     ),
+    prior: str = typer.Option(
+        "box",
+        help="shrinkage target: 'box' (box-score-informed prior mean) or "
+        "'zero' (plain ridge, shrink to league average)",
+    ),
     out_dir: str = typer.Option("app/data", help="output directory"),
 ) -> None:
     """Export precomputed results for the deployed app: it has no DuckDB
@@ -705,6 +777,8 @@ def export_app_data_cmd(
     """
     from nbare.export import (
         RAPM_LEADERBOARD_COLUMNS,
+        RAPM_LEADERBOARD_WITH_LAST_COLUMNS,
+        add_last_season,
         build_meta,
         rapm_leaderboard_rows,
         write_csv,
@@ -713,7 +787,7 @@ def export_app_data_cmd(
     )
     from nbare.rapm.blocks import blocks_from_warehouse, merge_warehouse_results
     from nbare.rapm.design import build_design
-    from nbare.rapm.fit import POINTS_PER_WIN, REPLACEMENT_LEVEL, fit_rapm
+    from nbare.rapm.fit import POINTS_PER_WIN, REPLACEMENT_LEVEL
 
     if replacement_level is None:
         replacement_level = REPLACEMENT_LEVEL
@@ -721,6 +795,9 @@ def export_app_data_cmd(
     season_list = [s.strip() for s in seasons.split(",")]
 
     per_season_results = []
+    all_game_ids: list[str] = []
+    last_label: str | None = None
+    last_game_ids: list[str] = []
     with session() as con:
         names = {
             r[0]: r[1]
@@ -737,8 +814,10 @@ def export_app_data_cmd(
                 console.print(f"[yellow]no games in warehouse for {s}, skipping")
                 continue
             game_ids = [r[0] for r in rows]
+            all_game_ids.extend(game_ids)
             console.print(f"[{s}] gating and building blocks from {len(game_ids):,} games...")
             per_season_results.append(blocks_from_warehouse(con, game_ids))
+            last_label, last_game_ids = s, game_ids
 
     if not per_season_results:
         console.print("[red]no seasons produced usable data; nothing exported.")
@@ -754,17 +833,46 @@ def export_app_data_cmd(
         f"design: {design.X.shape[0]:,} rows x {design.X.shape[1]:,} cols; "
         "fitting with grouped CV..."
     )
-    result = fit_rapm(design, replacement_level=replacement_level)
+    result, fit_type = _fit_with_prior(design, prior, all_game_ids, replacement_level)
+    console.print(f"fit: {fit_type}")
     console.print(
         f"selected lambda: {result.best_lambda}  fit on "
         f"{blockres.games_included:,} games / {blockres.stints_included:,} stints"
     )
 
+    # Second, single-season fit on the most recent season in the window:
+    # the same gate, the same prior type, its own lambda. Its blocks are
+    # the last per-season result, already gated above -- not re-derived.
+    last_res = per_season_results[-1]
+    last_meta = None
+    last_result = None
+    if len(per_season_results) > 1 and last_res.blocks:
+        last_design = build_design(last_res.blocks)
+        console.print(f"[{last_label}] single-season fit for the last-season columns...")
+        last_result, last_fit_type = _fit_with_prior(
+            last_design, prior, last_game_ids, replacement_level
+        )
+        console.print(
+            f"[{last_label}] selected lambda: {last_result.best_lambda}  fit on "
+            f"{last_res.games_included:,} games / {last_res.stints_included:,} stints"
+        )
+        last_meta = {
+            "season": last_label,
+            "n_games": last_res.games_included,
+            "n_stints": last_res.stints_included,
+            "lambda": last_result.best_lambda,
+            "fit_type": last_fit_type.replace("pooled multi-season", "single-season"),
+        }
+
     out = Path(out_dir)
 
     leaderboard_rows = rapm_leaderboard_rows(result, names)
     dropped = len(result.offense) - len(leaderboard_rows)
-    write_csv(leaderboard_rows, RAPM_LEADERBOARD_COLUMNS, out / "rapm_leaderboard.csv")
+    columns = RAPM_LEADERBOARD_COLUMNS
+    if last_result is not None:
+        leaderboard_rows = add_last_season(leaderboard_rows, last_result)
+        columns = RAPM_LEADERBOARD_WITH_LAST_COLUMNS
+    write_csv(leaderboard_rows, columns, out / "rapm_leaderboard.csv")
     console.print(
         f"[green]wrote {out / 'rapm_leaderboard.csv'} "
         f"({len(leaderboard_rows):,} rows)"
@@ -785,7 +893,8 @@ def export_app_data_cmd(
         lambda_=result.best_lambda,
         replacement_level=result.replacement_level,
         points_per_win=POINTS_PER_WIN,
-        fit_type="pooled multi-season ridge RAPM (zero-mean prior)",
+        fit_type=fit_type,
+        last_season=last_meta,
     )
     write_meta_json(meta, out / "meta.json")
     console.print(f"[green]wrote {out / 'meta.json'}")

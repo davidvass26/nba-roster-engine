@@ -6,10 +6,17 @@
   ],
   "n_games": 3169,
   "n_stints": 97449,
-  "lambda": 5000.0,
+  "lambda": 8000.0,
   "replacement_level": -2.5,
   "points_per_win": 30.0,
-  "generated_at": "2026-08-20T19:17:15.532930+00:00",
-  "fit_type": "pooled multi-season ridge RAPM (zero-mean prior)",
-  "projections_status": "not yet built: no real-data projections pipeline exists (Stage 3's delta/hierarchy/baseline layers are validated only on synthetic data so far). This file has headers only, zero rows."
+  "generated_at": "2026-10-19T21:53:13.003886+00:00",
+  "fit_type": "pooled multi-season ridge RAPM with box-score prior",
+  "projections_status": "not yet built: no real-data projections pipeline exists (Stage 3's delta/hierarchy/baseline layers are validated only on synthetic data so far). This file has headers only, zero rows.",
+  "last_season": {
+    "season": "2025-26",
+    "n_games": 1060,
+    "n_stints": 34219,
+    "lambda": 8000.0,
+    "fit_type": "single-season ridge RAPM with box-score prior"
+  }
 }

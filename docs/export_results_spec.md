@@ -20,6 +20,10 @@ Export these:
    `player_id, name, offense, defense, total, value, wins_added,
     possessions`. This is the full rate+value leaderboard from the pooled
    multi-season fit. Sorted by total descending.
+   Plus `last_offense, last_defense, last_total, last_wins_added,
+   last_possessions` from a separate single-season fit on the most recent
+   season in the window (same gate, same prior). Blank (not 0) for players
+   who did not play that season.
 
 2. `projections.csv` — one row per player per projected year, columns:
    `player_id, name, season, proj_offense, proj_defense, proj_total,
@@ -28,8 +32,12 @@ Export these:
 
 3. `meta.json` — provenance so the app can show it honestly:
    `{seasons_used: [...], n_games, n_stints, lambda, replacement_level,
-     points_per_win, generated_at, fit_type: "pooled multi-season ridge
-     with box-score prior"}`.
+     points_per_win, generated_at, fit_type: <the fit actually run, e.g.
+     "pooled multi-season ridge RAPM with box-score prior">}`. `fit_type`
+   must describe the real fit; it is returned by the fit itself
+   (`--prior box|zero`), never hardcoded. A `last_season` object records
+   `{season, n_games, n_stints, lambda, fit_type}` for the single-season
+   fit behind the `last_*` columns.
 
 ## Rules
 

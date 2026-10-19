@@ -13,7 +13,9 @@ projected wins under the 2023 CBA. It is built in stages:
 
 - **Stage 0** — data warehouse (DuckDB), cached ingestion, contract parsing
 - **Stage 1** — CBA rule engine (salary matching shipped; hard-cap triggers pending data)
-- **Stage 2** — Bayesian RAPM impact metric (ridge + box-score prior + on/off diagnostic shipped)
+- **Stage 2** — Bayesian RAPM impact metric (ridge + box-score prior + on/off
+  diagnostic shipped; `fit-rapm`/`export-app-data` default to `--prior box`,
+  features built from cached box scores by `rapm/box_features.py`)
 - **Stage 3** — multi-year player projections (v1 shipped: delta-method aging
   curve + player/position/league partial pooling + box-score baseline,
   numpyro/arviz; see `docs/stage3_spec.md`. Attrition, availability, and
@@ -71,7 +73,7 @@ flag it rather than working around it.
 
 - **Run the relevant SKILL.md first** if one applies (document/spreadsheet
   creation, etc.). For pure Python module work in `src/`, no skill applies.
-- **Tests must pass before committing.** `make test` (currently 119 tests).
+- **Tests must pass before committing.** `make test` (currently 219 tests, incl. doctests).
   Commit green so every point in history is a working state.
 - **Add tests with every behavior change.** This repo's credibility is its
   test suite. A change without a test is incomplete.
@@ -128,6 +130,7 @@ src/nbare/
     blocks.py          connector: stints -> offense blocks for the design
     synthetic.py       ground-truth game generators for validation
     prior.py           box-score-informed prior mean for Bayesian RAPM
+    box_features.py    cached box scores -> BoxScoreRow features for the prior
   projection/
     types.py           PlayerSeason: the shared per-layer input record
     delta.py           layer 1: delta-method aging curve (survivorship-safe)

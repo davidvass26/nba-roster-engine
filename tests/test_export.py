@@ -16,8 +16,11 @@ import json
 import pytest
 
 from nbare.export import (
+    LAST_SEASON_COLUMNS,
     PROJECTIONS_COLUMNS,
     RAPM_LEADERBOARD_COLUMNS,
+    RAPM_LEADERBOARD_WITH_LAST_COLUMNS,
+    add_last_season,
     build_meta,
     rapm_leaderboard_rows,
     write_csv,
@@ -98,11 +101,9 @@ def test_write_projections_stub_has_headers_and_zero_rows(tmp_path):
 
 
 def test_build_meta_reflects_actual_fit_type_not_the_spec_example():
-    """meta.json's fit_type must describe what was ACTUALLY run. The spec
-    text says 'pooled multi-season ridge with box-score prior', which
-    describes fit_rapm_bayesian -- but export-app-data runs plain
-    zero-mean fit_rapm, so the caller-supplied fit_type must say that,
-    not the spec's example string verbatim."""
+    """meta.json's fit_type must describe what was ACTUALLY run: it is
+    whatever the caller passes (the label the fit returned), never a
+    hardcoded spec example string."""
     meta = build_meta(
         seasons_used=["2023-24", "2024-25", "2025-26"],
         n_games=3169,
@@ -129,3 +130,68 @@ def test_write_meta_json_round_trips(tmp_path):
     path = tmp_path / "meta.json"
     write_meta_json(meta, path)
     assert json.loads(path.read_text()) == meta
+
+
+# --- last-season columns ---------------------------------------------------
+
+def test_add_last_season_attaches_single_season_numbers_by_player(result):
+    """Planted: the 'last season' fit only contains players 1 and 2 with
+    known ratings. Pooled order is preserved, last_* values come from the
+    last-season result for the right player, and player 3 -- absent from
+    the last season -- gets None, not 0.0 (0.0 would claim 'league
+    average')."""
+    P1, P2, OPP = 1, 2, 99
+    last = fit_rapm(build_design([
+        OffenseBlock("g9", frozenset({P1}), frozenset({OPP}), 14.0, 10.0),
+        OffenseBlock("g9", frozenset({OPP}), frozenset({P1}), 7.0, 10.0),
+        OffenseBlock("g9", frozenset({P2}), frozenset({OPP}), 8.0, 10.0),
+        OffenseBlock("g9", frozenset({OPP}), frozenset({P2}), 11.0, 10.0),
+    ]), fixed_lambda=100.0)
+    names = {1: "Player One", 2: "Player Two", 3: "Player Three"}
+    pooled = rapm_leaderboard_rows(result, names)
+    rows = add_last_season(pooled, last)
+
+    assert [r["player_id"] for r in rows] == [r["player_id"] for r in pooled]
+    by = {r["player_id"]: r for r in rows}
+    for pid in (P1, P2):
+        assert by[pid]["last_offense"] == pytest.approx(last.offense[pid])
+        assert by[pid]["last_defense"] == pytest.approx(last.defense[pid])
+        assert by[pid]["last_total"] == pytest.approx(last.total(pid))
+        assert by[pid]["last_wins_added"] == pytest.approx(last.wins_added[pid])
+        assert by[pid]["last_possessions"] == pytest.approx(last.possessions[pid])
+        # pooled numbers untouched
+        assert by[pid]["total"] == pytest.approx(result.total(pid))
+    assert all(by[3][c] is None for c in LAST_SEASON_COLUMNS)
+    # The planted last-season edge: P1 outscored, P2 was outscored.
+    assert by[P1]["last_total"] > 0 > by[P2]["last_total"]
+
+
+def test_last_season_columns_round_trip_with_blank_cells(tmp_path, result):
+    rows = add_last_season(
+        rapm_leaderboard_rows(result, {1: "A", 2: "B", 3: "C"}),
+        fit_rapm(build_design([
+            OffenseBlock("g9", frozenset({1}), frozenset({99}), 12.0, 10.0),
+            OffenseBlock("g9", frozenset({99}), frozenset({1}), 9.0, 10.0),
+        ]), fixed_lambda=100.0),
+    )
+    path = tmp_path / "rapm_leaderboard.csv"
+    write_csv(rows, RAPM_LEADERBOARD_WITH_LAST_COLUMNS, path)
+    with path.open() as f:
+        got = {r["name"]: r for r in csv.DictReader(f)}
+    assert got["A"]["last_total"] != ""
+    assert got["B"]["last_total"] == ""   # not in last season -> blank, not 0
+
+
+def test_build_meta_records_last_season_provenance():
+    last = {"season": "2025-26", "n_games": 1000, "n_stints": 30000,
+            "lambda": 3000.0, "fit_type": "single-season ridge RAPM"}
+    meta = build_meta(
+        seasons_used=["2024-25", "2025-26"], n_games=2000, n_stints=60000,
+        lambda_=5000.0, replacement_level=-2.5, points_per_win=30.0,
+        fit_type="pooled", last_season=last,
+    )
+    assert meta["last_season"] == last
+    assert "last_season" not in build_meta(
+        seasons_used=["2025-26"], n_games=1, n_stints=1, lambda_=1.0,
+        replacement_level=-2.5, points_per_win=30.0, fit_type="x",
+    )

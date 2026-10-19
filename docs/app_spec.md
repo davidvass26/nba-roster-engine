@@ -66,13 +66,15 @@ soon)** · **Methodology**
 
 ### 3. Impact (RAPM rate + value)
 
-- Two leaderboards side by side (or toggle): RATE (by total RAPM, with
-  offense/defense split) and VALUE (by value / wins-added, with possessions).
+- One leaderboard: last-season RAPM, multi-season (pooled) RAPM, and Wins
+  Added for each window, with a toggle for the offense/defense split and
+  possessions. Last-season = separate single-season fit (current, noisier);
+  pooled = more stable. Multi-season Wins Added is a total, labeled as such.
 - One-line explainer between them: "Rate = per-possession quality; Value =
   total contribution (rate x volume above replacement)."
 - Sortable; searchable by player.
-- A prominent methodology note: "Multi-season regularized RAPM (2023–26) with
-  a box-score-informed prior. Single-team dominance can inflate individual
+- A prominent methodology note: "Multi-season regularized RAPM (2023–26)
+  [fit type from meta.json — e.g. "with box-score prior"]. Single-team dominance can inflate individual
   defensive ratings; schedule and garbage-time adjustments are in
   development. Replacement level is an approximate placeholder." Pull the
   seasons/lambda/etc from meta.json so it's honest and auto-updating.

@@ -62,20 +62,22 @@ REPLACEMENT_LEVEL: float = -2.5
 POINTS_PER_WIN: float = 30.0
 
 
-def _player_possessions(design: DesignMatrix) -> dict[int, float]:
-    """Total possessions each player was on the floor for: the sum of
-    block possession weights (`design.w`) over every design row where
-    they appear, offense or defense combined. Reads directly off the same
-    design matrix the ridge fit on -- not a fresh pass over blocks -- so
-    this can never disagree with what the model actually saw.
+def player_side_possessions(
+    design: DesignMatrix,
+) -> tuple[dict[int, float], dict[int, float]]:
+    """(offensive possessions, defensive possessions) per player: the sum of
+    block possession weights (`design.w`) over the design rows where they
+    appear on that side. Reads directly off the same design matrix the
+    ridge fit on -- not a fresh pass over blocks -- so this can never
+    disagree with what the model actually saw.
     """
     Xc = design.X.tocsc()
-    poss: dict[int, float] = {}
+    off_poss: dict[int, float] = {}
+    def_poss: dict[int, float] = {}
     for pid, i in design.player_index.items():
-        off_rows = Xc.getcol(2 * i).indices
-        def_rows = Xc.getcol(2 * i + 1).indices
-        poss[pid] = float(design.w[off_rows].sum() + design.w[def_rows].sum())
-    return poss
+        off_poss[pid] = float(design.w[Xc.getcol(2 * i).indices].sum())
+        def_poss[pid] = float(design.w[Xc.getcol(2 * i + 1).indices].sum())
+    return off_poss, def_poss
 
 
 def compute_value(
@@ -86,8 +88,11 @@ def compute_value(
 ) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
     """Post-fit value metric. Returns (possessions, value, wins_added).
 
-        value = (total_rapm - replacement_level) * possessions / 100
+        value = ((off - R/2) * off_poss + (def - R/2) * def_poss) / 100
         wins_added = value / POINTS_PER_WIN
+
+    where R is `replacement_level` and `possessions` (returned, and shown
+    in the app) is off_poss + def_poss.
 
     This turns the RATE stat (RAPM, points per 100 possessions) into a
     VOLUME stat by multiplying by playing time -- the same rate-times-
@@ -95,14 +100,31 @@ def compute_value(
     from already-fitted ratings and the design matrix's own possession
     weights; nothing here feeds back into or changes the ridge
     coefficients.
+
+    Why each side is weighted by ITS OWN possessions: the offensive rating
+    is points per 100 *offensive* possessions and the defensive rating is
+    points per 100 *defensive* possessions, so total RAPM (off + def) is a
+    rate per 100 possessions OF EACH KIND -- i.e. per ~200 combined. An
+    earlier version multiplied total RAPM by combined possessions, which
+    counted every possession twice and doubled value and wins added (a
+    ~32-win/season SGA). Since off_poss ~= def_poss for any real player,
+    the formula above is ~= (total - R) * combined_poss / 200.
+
+    Replacement level R is a TOTAL (off + def) rating, so it is split
+    evenly across the two sides (R/2 per side). That split is an
+    assumption -- the placeholder R itself is not calibrated by side --
+    but it is exactly consistent with R as a total whenever a player's
+    offensive and defensive possessions are equal.
     """
-    possessions = _player_possessions(design)
+    off_poss, def_poss = player_side_possessions(design)
+    half_r = replacement_level / 2.0
+    possessions: dict[int, float] = {}
     value: dict[int, float] = {}
     wins_added: dict[int, float] = {}
     for pid in offense:
-        total = offense[pid] + defense.get(pid, 0.0)
-        poss = possessions.get(pid, 0.0)
-        v = (total - replacement_level) * poss / 100.0
+        po, pd = off_poss.get(pid, 0.0), def_poss.get(pid, 0.0)
+        v = ((offense[pid] - half_r) * po + (defense.get(pid, 0.0) - half_r) * pd) / 100.0
+        possessions[pid] = po + pd
         value[pid] = v
         wins_added[pid] = v / POINTS_PER_WIN
     return possessions, value, wins_added
@@ -118,7 +140,7 @@ class RAPMResult:
     n_rows: int
     n_players: int
     possessions: dict[int, float]  # player_id -> total possessions (off + def)
-    value: dict[int, float]        # player_id -> (total - replacement) * poss/100
+    value: dict[int, float]        # player_id -> points above replacement (see compute_value)
     wins_added: dict[int, float]   # player_id -> value / POINTS_PER_WIN
     replacement_level: float       # the replacement_level value used above
 

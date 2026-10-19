@@ -70,9 +70,20 @@ def rapm_badge(name: str, lookup: dict[str, dict]) -> str:
     r = lookup.get(name)
     if r is None:
         return "_no RAPM data (name not matched to the pooled-fit leaderboard)_"
+    last = (meta.get("last_season") or {}).get("season")
+    n = len(meta.get("seasons_used") or [])
+    yr = f"{n}-yr" if n > 1 else "pooled"
+    pooled = (
+        f"{yr} RAPM {r['total']:+.1f} (off {r['offense']:+.1f} / def {r['defense']:+.1f})"
+        f"  ·  {yr} Wins Added {r['wins_added']:+.1f}"
+    )
+    if last is None or "last_total" not in r:
+        return pooled
+    if r["last_total"] is None:
+        return f"_did not play {last}_  ·  " + pooled
     return (
-        f"RAPM {r['total']:+.1f} (off {r['offense']:+.1f} / def {r['defense']:+.1f})"
-        f"  ·  Wins Added {r['wins_added']:+.1f}"
+        f"{last} RAPM {r['last_total']:+.1f}  ·  {last} Wins Added "
+        f"{r['last_wins_added']:+.1f}  ·  " + pooled
     )
 
 
@@ -275,7 +286,7 @@ with tab_cap:
 
 # --- Impact -------------------------------------------------------------
 with tab_impact:
-    st.subheader("Impact — RAPM rate + value")
+    st.subheader("Impact — RAPM and Wins Added")
     if rapm_board.is_empty():
         st.warning(
             "No RAPM leaderboard found. Run `nbare export-app-data` to "
@@ -287,39 +298,63 @@ with tab_impact:
         if search:
             board = board.filter(pl.col("name").str.contains(f"(?i){search}"))
 
-        st.caption(
-            "**Rate** = per-possession quality (points per 100 possessions "
-            "above average). **Value** = total contribution "
-            "(rate × volume above replacement)."
+        last_info = meta.get("last_season") or {}
+        last_season = last_info.get("season")
+        has_last = last_season is not None and "last_total" in board.columns
+        window = (
+            f"{meta['seasons_used'][0][:4]}–{meta['seasons_used'][-1][-2:]}"
+            if meta.get("seasons_used") else "pooled"
         )
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Rate — by total RAPM**")
-            st.dataframe(
-                board.select("name", "total", "offense", "defense")
-                .sort("total", descending=True)
-                .rename({"name": "Player", "total": "Total", "offense": "Off", "defense": "Def"}),
-                width="stretch", hide_index=True,
-                column_config={
-                    "Total": st.column_config.NumberColumn(format="%+.1f"),
-                    "Off": st.column_config.NumberColumn(format="%+.1f"),
-                    "Def": st.column_config.NumberColumn(format="%+.1f"),
-                },
+
+        st.caption(
+            "**RAPM** = per-possession impact (points per 100 possessions vs. "
+            "league average, offense + defense). **Wins Added** = total "
+            "contribution: rate × playing time above replacement level, "
+            f"÷ {meta.get('points_per_win', 30):g} points per win. "
+            + (f"**{last_season}** columns come from a separate fit on that "
+               "season alone (more current, noisier); "
+               if has_last else "")
+            + f"**{window}** columns pool every season (more stable). "
+            "Multi-season Wins Added is a total across all those seasons, "
+            "not a per-season average. Blank = did not play that season."
+        )
+        split = st.toggle("Show offense / defense split", key="impact_split")
+
+        cols = ["name"]
+        rename = {"name": "Player"}
+        fmt = {}
+        if has_last:
+            cols += ["last_total"] + (["last_offense", "last_defense"] if split else [])
+            rename.update({"last_total": f"RAPM {last_season}",
+                           "last_offense": f"Off {last_season}",
+                           "last_defense": f"Def {last_season}"})
+        cols += ["total"] + (["offense", "defense"] if split else [])
+        rename.update({"total": f"RAPM {window}", "offense": f"Off {window}",
+                       "defense": f"Def {window}"})
+        if has_last:
+            cols += ["last_wins_added"]
+            rename["last_wins_added"] = f"Wins Added {last_season}"
+        cols += ["wins_added"]
+        rename["wins_added"] = f"Wins Added {window} (total)"
+        if split:
+            if has_last:
+                cols += ["last_possessions"]
+                rename["last_possessions"] = f"Poss {last_season}"
+            cols += ["possessions"]
+            rename["possessions"] = f"Poss {window}"
+        for c in cols[1:]:
+            fmt[rename[c]] = st.column_config.NumberColumn(
+                format="%d" if "possessions" in c else "%+.1f"
             )
-        with c2:
-            st.markdown("**Value — by value / wins added**")
-            st.dataframe(
-                board.select("name", "value", "wins_added", "possessions")
-                .sort("value", descending=True)
-                .rename({"name": "Player", "value": "Value", "wins_added": "Wins Added",
-                          "possessions": "Possessions"}),
-                width="stretch", hide_index=True,
-                column_config={
-                    "Value": st.column_config.NumberColumn(format="%+.0f"),
-                    "Wins Added": st.column_config.NumberColumn(format="%+.1f"),
-                    "Possessions": st.column_config.NumberColumn(format="%d"),
-                },
-            )
+
+        sort_col = "last_total" if has_last else "total"
+        st.dataframe(
+            board.select(cols)
+            .sort(sort_col, descending=True, nulls_last=True)
+            .rename({c: rename[c] for c in cols}),
+            width="stretch", hide_index=True, column_config=fmt,
+        )
+        st.caption("Click any column header to re-sort.")
 
         seasons_used = ", ".join(meta.get("seasons_used", []))
         st.info(
@@ -330,6 +365,10 @@ with tab_impact:
             f"Replacement level ({meta.get('replacement_level', '?')} pts/100) "
             "is an approximate placeholder, not empirically calibrated yet "
             f"— see the Methodology tab. Generated {meta.get('generated_at', '?')}."
+            + (f" {last_season} columns: {last_info.get('fit_type', '?')}, "
+               f"λ={last_info.get('lambda', '?')}, "
+               f"{last_info.get('n_games', 0):,} games."
+               if has_last else "")
         )
 
 # --- Projections ----------------------------------------------------------

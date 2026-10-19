@@ -596,6 +596,91 @@ def _parse_box_score_payload(payload: dict[str, Any], game_id: str) -> pl.DataFr
     )
 
 
+# Full per-player counting stats, beyond the minutes/pts/reb/ast that
+# stg.box_player stores. The box-score RAPM prior (rapm/box_features.py)
+# needs these; `seconds_played` + team totals are what turn them into
+# per-100-possession rates.
+BOX_DETAIL_SCHEMA: dict[str, Any] = {
+    "game_id": pl.Utf8, "nba_player_id": pl.Int64, "nba_team_id": pl.Int64,
+    "seconds_played": pl.Int32, "position": pl.Utf8,
+    "pts": pl.Int32, "ast": pl.Int32, "tov": pl.Int32,
+    "fga": pl.Int32, "fta": pl.Int32,
+    "oreb": pl.Int32, "dreb": pl.Int32, "stl": pl.Int32, "blk": pl.Int32,
+}
+
+
+def parse_box_score_detail(payload: dict[str, Any], game_id: str) -> pl.DataFrame:
+    """Parse a BoxScoreTraditionalV3 payload into full per-player counting
+    stats (see BOX_DETAIL_SCHEMA). Same nested payload shape as
+    `_parse_box_score_payload` -- read its docstring for why this must not
+    go through `result_set_to_df`.
+
+    `position` is kept raw ("G"/"F"/"C"/... for starters, "" for bench):
+    nba.com only labels starters, so it is a partial signal and callers
+    must treat "" as UNKNOWN, not as "not a big". A missing counting stat
+    stays null rather than becoming 0.
+    """
+    box = payload.get("boxScoreTraditional")
+    if not box:
+        return pl.DataFrame(schema=BOX_DETAIL_SCHEMA)
+
+    rows: list[dict[str, Any]] = []
+    for team_key in ("homeTeam", "awayTeam"):
+        team = box.get(team_key) or {}
+        team_id = team.get("teamId")
+        for player in team.get("players", []):
+            stats = player.get("statistics") or {}
+            rows.append({
+                "game_id": game_id,
+                "nba_player_id": player.get("personId"),
+                "nba_team_id": team_id,
+                "seconds_played": parse_minutes_to_seconds(stats.get("minutes")),
+                "position": (player.get("position") or "").strip(),
+                "pts": stats.get("points"),
+                "ast": stats.get("assists"),
+                "tov": stats.get("turnovers"),
+                "fga": stats.get("fieldGoalsAttempted"),
+                "fta": stats.get("freeThrowsAttempted"),
+                "oreb": stats.get("reboundsOffensive"),
+                "dreb": stats.get("reboundsDefensive"),
+                "stl": stats.get("steals"),
+                "blk": stats.get("blocks"),
+            })
+    return pl.DataFrame(rows, schema=BOX_DETAIL_SCHEMA)
+
+
+def box_detail_from_cache(
+    game_ids: Iterable[str], cache: NBAStatsCache | None = None
+) -> tuple[pl.DataFrame, list[str]]:
+    """Full box-score detail for `game_ids`, read from the disk cache ONLY.
+
+    Never fetches: this runs as part of a fit, and a fit must not silently
+    turn into a rate-limited nba.com backfill (or fail in a sandbox where
+    nba.com is unreachable). Games with no cached box score are returned
+    in the second element so the caller can report them honestly instead
+    of pretending coverage is complete. Run `make box SEASON=...` to fill
+    them.
+    """
+    from nbare.ingest.client import request_hash
+
+    if cache is None:
+        cache = NBAStatsCache()
+    frames: list[pl.DataFrame] = []
+    missing: list[str] = []
+    for gid in game_ids:
+        hit = cache.get(request_hash("BoxScoreTraditionalV3", {"game_id": gid}))
+        if hit is None:
+            missing.append(gid)
+            continue
+        df = parse_box_score_detail(hit["payload"], gid)
+        if df.is_empty():
+            missing.append(gid)
+            continue
+        frames.append(df)
+    detail = pl.concat(frames) if frames else pl.DataFrame(schema=BOX_DETAIL_SCHEMA)
+    return detail, missing
+
+
 def ingest_box_scores(con, game_ids: Iterable[str], cache: NBAStatsCache | None = None) -> int:
     """Traditional box score for a list of games.
 

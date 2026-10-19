@@ -40,6 +40,21 @@ RAPM_LEADERBOARD_COLUMNS = [
     "wins_added", "possessions",
 ]
 
+# Last-season columns, from a separate single-season fit (the most recent
+# season in the pooled window) alongside the pooled multi-season numbers
+# above. The pooled fit is the more stable rating; the last-season fit is
+# the more current one -- the app shows both so a visitor can see who is
+# trending, instead of picking one window and hiding the other. A player
+# who did not appear in the last season gets EMPTY cells, not 0.0: 0.0
+# would read as "exactly league average", which is a claim the data
+# does not support.
+LAST_SEASON_COLUMNS = [
+    "last_offense", "last_defense", "last_total", "last_wins_added",
+    "last_possessions",
+]
+
+RAPM_LEADERBOARD_WITH_LAST_COLUMNS = RAPM_LEADERBOARD_COLUMNS + LAST_SEASON_COLUMNS
+
 PROJECTIONS_COLUMNS = [
     "player_id", "name", "season", "proj_offense", "proj_defense",
     "proj_total", "lower_80", "upper_80",
@@ -81,6 +96,32 @@ def rapm_leaderboard_rows(result: Any, names: dict[int, str]) -> list[dict]:
     return rows
 
 
+def add_last_season(rows: list[dict], last: Any) -> list[dict]:
+    """Attach single-season (`last`, a RAPMResult) columns to pooled
+    leaderboard rows from `rapm_leaderboard_rows`, keyed by player_id.
+
+    Row order is left exactly as given (pooled-total order), so the
+    round-trip check against `fit-rapm` still holds. Players absent from
+    the last-season fit get None in every last_* column -- see
+    LAST_SEASON_COLUMNS for why not 0.0.
+    """
+    out = []
+    for r in rows:
+        pid = r["player_id"]
+        if pid in last.offense:
+            extra = {
+                "last_offense": last.offense[pid],
+                "last_defense": last.defense[pid],
+                "last_total": last.total(pid),
+                "last_wins_added": last.wins_added.get(pid),
+                "last_possessions": last.possessions.get(pid),
+            }
+        else:
+            extra = {c: None for c in LAST_SEASON_COLUMNS}
+        out.append({**r, **extra})
+    return out
+
+
 def write_csv(rows: list[dict], columns: list[str], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
@@ -103,17 +144,16 @@ def build_meta(
     replacement_level: float,
     points_per_win: float,
     fit_type: str,
+    last_season: dict | None = None,
 ) -> dict:
     """Provenance for the app to show honestly, per docs/export_results_spec.md.
 
     `fit_type` is passed in, not hardcoded, so this can never silently
-    drift from what was actually run (the spec's own example text,
-    "pooled multi-season ridge with box-score prior", describes the
-    Bayesian prior variant, `fit_rapm_bayesian` -- the export currently
-    runs plain zero-mean `fit_rapm`, so the caller must pass the string
-    that matches reality).
+    drift from what was actually run: the CLI passes the label returned
+    by the fit it ran (`--prior box` -> `fit_rapm_bayesian` with the
+    box-score prior; `--prior zero` -> plain zero-mean `fit_rapm`).
     """
-    return {
+    meta = {
         "seasons_used": seasons_used,
         "n_games": n_games,
         "n_stints": n_stints,
@@ -124,6 +164,11 @@ def build_meta(
         "fit_type": fit_type,
         "projections_status": PROJECTIONS_STATUS_NOT_BUILT,
     }
+    if last_season is not None:
+        # {season, n_games, n_stints, lambda, fit_type} of the single-season
+        # fit behind the last_* leaderboard columns.
+        meta["last_season"] = last_season
+    return meta
 
 
 def write_meta_json(meta: dict, path: Path) -> None:

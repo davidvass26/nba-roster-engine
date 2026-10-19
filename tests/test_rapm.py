@@ -194,19 +194,44 @@ def test_compute_value_scales_with_rating_and_possessions():
     assert possessions[B] == pytest.approx(200.0)
     assert possessions[C] == pytest.approx(100.0)
 
-    assert value[A] == pytest.approx((3.0 - REPLACEMENT_LEVEL) * 100 / 100)
-    assert value[B] == pytest.approx((3.0 - REPLACEMENT_LEVEL) * 200 / 100)
-    assert value[C] == pytest.approx((6.0 - REPLACEMENT_LEVEL) * 100 / 100)
+    # Each side's rating is weighted by that side's possessions, with
+    # replacement split evenly (R/2 per side).
+    h = REPLACEMENT_LEVEL / 2
+    assert value[A] == pytest.approx(((3.0 - h) * 60 + (0.0 - h) * 40) / 100)
+    assert value[B] == pytest.approx(((3.0 - h) * 120 + (0.0 - h) * 80) / 100)
+    assert value[C] == pytest.approx(((6.0 - h) * 60 + (0.0 - h) * 40) / 100)
 
     # Same rating, double the possessions -> exactly double the value.
     assert value[B] == pytest.approx(2 * value[A])
-    # Same possessions, higher rating -> proportionally higher value.
-    assert value[C] / value[A] == pytest.approx(
-        (6.0 - REPLACEMENT_LEVEL) / (3.0 - REPLACEMENT_LEVEL)
-    )
+    # Same possessions, +3 offense on 60 offensive possessions -> exactly
+    # 1.8 more points of value.
+    assert value[C] - value[A] == pytest.approx(3.0 * 60 / 100)
 
     assert wins_added[A] == pytest.approx(value[A] / POINTS_PER_WIN)
     assert wins_added[B] == pytest.approx(value[B] / POINTS_PER_WIN)
+
+
+def test_compute_value_recovers_planted_points_without_double_counting():
+    """Planted truth: a player who is +4 on offense and +2 on defense, over
+    250 offensive and 250 defensive possessions, adds exactly
+    4*250/100 + 2*250/100 = 15 points over an average player. With
+    replacement level set to 0, value must equal that -- NOT the 30 the old
+    (total * combined possessions) formula produced by counting every
+    possession twice."""
+    P, OPP = 5, 99
+    blocks = [
+        OffenseBlock("g1", frozenset({P}), frozenset({OPP}), 0.0, 250.0),
+        OffenseBlock("g1", frozenset({OPP}), frozenset({P}), 0.0, 250.0),
+    ]
+    design = build_design(blocks)
+
+    possessions, value, wins_added = compute_value(
+        design, {P: 4.0, OPP: 0.0}, {P: 2.0, OPP: 0.0}, replacement_level=0.0
+    )
+
+    assert possessions[P] == pytest.approx(500.0)
+    assert value[P] == pytest.approx(15.0)
+    assert wins_added[P] == pytest.approx(15.0 / POINTS_PER_WIN)
 
 
 def test_compute_value_is_zero_at_replacement_level():
