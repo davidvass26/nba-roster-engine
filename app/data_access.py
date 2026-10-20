@@ -9,12 +9,21 @@ anything from `nbare.warehouse`, `nbare.rapm`, or `nbare.projection`
 would either fail there or silently pull in deps (duckdb usage aside,
 numpyro/jax) the deploy is meant to stay lean without.
 
-Auto-refresh on CSV edits
---------------------------
-`load_contract_years` is cached on the contract CSV's mtime, not a static
-key. Editing the CSV changes its mtime, which changes the cache key, which
-forces a recompute on the next Streamlit rerun (e.g. a browser refresh).
-A static cache key would silently serve stale contract data forever.
+Auto-refresh on file changes
+-----------------------------
+EVERY loader is cached on its file's (mtime, size), never a static key.
+Editing a file changes that fingerprint, which changes the cache key, which
+forces a reload on the next Streamlit rerun (e.g. a browser refresh). This
+matters for app/data/* too, not just the contract CSV: Streamlit Cloud
+applies a git push by re-running the script INSIDE the running process,
+and `st.cache_data` survives that -- a static key kept serving the
+pre-push, header-only projections.csv after real projections were pushed.
+
+The fingerprint argument must NOT start with an underscore: Streamlit
+excludes underscore-prefixed arguments from the cache key entirely
+(verified on streamlit 1.62 -- changing `_mtime` returned the stale
+value). An earlier version named it `_mtime`, so contract-CSV edits never
+actually invalidated anything.
 """
 
 from __future__ import annotations
@@ -35,13 +44,19 @@ CONTRACT_CSV = REPO_ROOT / "data" / "raw" / "bbref_contracts_2026-27.csv"
 APP_DATA_DIR = APP_DIR / "data"
 
 
+def file_fingerprint(path: Path) -> tuple[int, int] | None:
+    """(mtime_ns, size) -- the cache key for a file's contents; None if the
+    file does not exist (so "missing" is its own cache entry too)."""
+    if not path.exists():
+        return None
+    st_ = path.stat()
+    return (st_.st_mtime_ns, st_.st_size)
+
+
 @st.cache_data(show_spinner=False)
-def _load_contract_years_cached(csv_path: str, _mtime: float) -> pl.DataFrame:
-    """`_mtime` is the real cache key (Streamlit hashes all args); it is
-    prefixed with an underscore only to signal "don't use this value for
-    anything but invalidation" to a reader, not to hide it from caching --
-    Streamlit does not skip underscore-prefixed *value* args, only
-    underscore-prefixed *unhashable* args, and a float is hashable."""
+def _load_contract_years_cached(csv_path: str, fingerprint: tuple[int, int]) -> pl.DataFrame:
+    """`fingerprint` is unused in the body; it exists only to be part of the
+    cache key (see the module docstring for why it has no underscore)."""
     return to_contract_years(load_raw(csv_path))
 
 
@@ -49,9 +64,7 @@ def load_contract_years() -> pl.DataFrame:
     if not CONTRACT_CSV.exists():
         st.error(f"Contract CSV not found at {CONTRACT_CSV}.")
         st.stop()
-    return _load_contract_years_cached(
-        str(CONTRACT_CSV), CONTRACT_CSV.stat().st_mtime
-    )
+    return _load_contract_years_cached(str(CONTRACT_CSV), file_fingerprint(CONTRACT_CSV))
 
 
 def teams_in(years: pl.DataFrame, season: str) -> list[str]:
@@ -104,32 +117,36 @@ def player_row(years: pl.DataFrame, slug: str, season: str) -> dict | None:
 
 
 # --- precomputed app/data/*  (RAPM leaderboard, projections, meta) --------
-# Static cache key is correct here, unlike the contract CSV: these files
-# are baked into the deploy by `nbare export-app-data` ahead of time and
-# are not meant to change within a running app instance.
+# Keyed on each file's fingerprint, like the contract CSV -- see the module
+# docstring for the redeploy bug a static key caused.
 
 @st.cache_data(show_spinner=False)
+def _read_csv_cached(path: str, fingerprint: tuple[int, int] | None) -> pl.DataFrame:
+    if fingerprint is None:
+        return pl.DataFrame()
+    return pl.read_csv(path)
+
+
+@st.cache_data(show_spinner=False)
+def _read_json_cached(path: str, fingerprint: tuple[int, int] | None) -> dict:
+    if fingerprint is None:
+        return {}
+    return json.loads(Path(path).read_text())
+
+
 def load_rapm_leaderboard() -> pl.DataFrame:
     path = APP_DATA_DIR / "rapm_leaderboard.csv"
-    if not path.exists():
-        return pl.DataFrame()
-    return pl.read_csv(path)
+    return _read_csv_cached(str(path), file_fingerprint(path))
 
 
-@st.cache_data(show_spinner=False)
 def load_projections() -> pl.DataFrame:
     path = APP_DATA_DIR / "projections.csv"
-    if not path.exists():
-        return pl.DataFrame()
-    return pl.read_csv(path)
+    return _read_csv_cached(str(path), file_fingerprint(path))
 
 
-@st.cache_data(show_spinner=False)
 def load_meta() -> dict:
     path = APP_DATA_DIR / "meta.json"
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text())
+    return _read_json_cached(str(path), file_fingerprint(path))
 
 
 def rapm_lookup_by_name(leaderboard: pl.DataFrame) -> dict[str, dict]:

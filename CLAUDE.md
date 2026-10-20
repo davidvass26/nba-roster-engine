@@ -174,6 +174,11 @@ nbare export-projections                   # Stage 3 on real data -> app/data (~
 - **Grouped CV, not random CV, for RAPM lambda.** Stints from one game share
   lineups/pace; random splits leak and pick too-small lambda. Split on
   `game_id`.
+- **Streamlit ignores underscore-prefixed args in `st.cache_data` keys**,
+  and its cache survives a Streamlit Cloud redeploy (same process). Key
+  every app loader on a file fingerprint passed as a plain-named arg
+  (`app/data_access.file_fingerprint`); a static key or `_mtime` serves
+  stale data after a push.
 - **Shrunk estimates are not measurements.** Never feed a ridge rating and
   its posterior SD to a second model as an unbiased observation — the prior
   gets counted twice (it flattened every aging curve to sigma_player ~0.05).
