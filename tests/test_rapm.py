@@ -276,3 +276,117 @@ def test_fit_rapm_populates_value_fields():
     ranked = res.value_ranking()
     values = [v for _, v, *_ in ranked]
     assert values == sorted(values, reverse=True)
+
+# --- posterior standard errors ----------------------------------------------
+
+def test_rapm_standard_errors_have_calibrated_coverage():
+    """Planted truth drawn from the ridge's own prior (ratings ~ N(0, tau^2),
+    row noise variance sigma^2 / possessions, lambda = sigma^2 / tau^2): in
+    exactly that setting the ridge posterior is the true Bayesian posterior,
+    so +/-1.645 SE intervals must contain the planted rating ~90% of the
+    time across players. Too-narrow SEs would make Stage 3 overconfident;
+    too-wide ones would hide real aging signal."""
+    from nbare.rapm.fit import rapm_standard_errors
+
+    tau, noise = 2.0, 2.0
+    sigma2 = 100.0 * noise**2          # Var(y) = 100 noise^2 / poss (see _simulate)
+    lam = sigma2 / tau**2
+    inside, total, se_sizes = 0, 0, []
+    for seed in range(4):
+        rng = np.random.default_rng(100 + seed)
+        n = 40
+        to = {p: float(rng.normal(0, tau)) for p in range(n)}
+        td = {p: float(rng.normal(0, tau)) for p in range(n)}
+        design = build_design(_simulate(n, 300, to, td, 100 + seed, noise=noise))
+        res = fit_rapm(design, fixed_lambda=lam)
+        off_se, def_se = rapm_standard_errors(design, res)
+        for p in design.player_index:
+            for est, se, truth in ((res.offense[p], off_se[p], to[p]),
+                                   (res.defense[p], def_se[p], td[p])):
+                inside += abs(est - truth) <= 1.645 * se
+                total += 1
+                se_sizes.append(se)
+    coverage = inside / total
+    assert 0.85 <= coverage <= 0.95, coverage
+    # And they are informative, not just the prior sd (tau) everywhere.
+    assert np.median(se_sizes) < 0.8 * tau
+
+
+def test_rapm_standard_errors_shrink_with_more_data():
+    from nbare.rapm.fit import rapm_standard_errors
+
+    rng = np.random.default_rng(5)
+    n = 20
+    to = {p: float(rng.normal(0, 2)) for p in range(n)}
+    td = {p: float(rng.normal(0, 2)) for p in range(n)}
+    small = build_design(_simulate(n, 60, to, td, 5))
+    big = build_design(_simulate(n, 600, to, td, 5))
+    se_small = np.median(list(rapm_standard_errors(small, fit_rapm(small, fixed_lambda=100.0))[0].values()))
+    se_big = np.median(list(rapm_standard_errors(big, fit_rapm(big, fixed_lambda=100.0))[0].values()))
+    assert se_big < 0.6 * se_small
+
+
+def _planted_fits(seed, n=40, tau=2.0, noise=2.0, n_games=300):
+    rng = np.random.default_rng(seed)
+    to = {p: float(rng.normal(0, tau)) for p in range(n)}
+    td = {p: float(rng.normal(0, tau)) for p in range(n)}
+    design = build_design(_simulate(n, n_games, to, td, seed, noise=noise))
+    lam = 100.0 * noise**2 / tau**2
+    return design, to, td, lam
+
+
+def test_likelihood_measurements_are_unbiased_and_calibrated():
+    """Planted truth: the prior-divided measurements must be centered on
+    the TRUE ratings (slope ~1 -- the shrunk ridge estimates have slope
+    < 1) with SEs that cover truth at the nominal rate. These are what
+    Stage 3 consumes as measurements; shrunk estimates would flatten
+    every aging curve."""
+    from nbare.rapm.fit import likelihood_measurements
+
+    truth, est, shrunk, inside, total = [], [], [], 0, 0
+    for seed in range(4):
+        design, to, td, lam = _planted_fits(200 + seed)
+        res = fit_rapm(design, fixed_lambda=lam)
+        lm = likelihood_measurements(design, res)
+        for p in design.player_index:
+            for t, e, se, m in ((to[p], lm.offense.get(p), lm.offense_se.get(p), res.offense[p]),
+                                (td[p], lm.defense.get(p), lm.defense_se.get(p), res.defense[p])):
+                if e is None:
+                    continue
+                truth.append(t); est.append(e); shrunk.append(m)
+                inside += abs(e - t) <= 1.645 * se
+                total += 1
+    truth, est, shrunk = map(np.array, (truth, est, shrunk))
+    slope = np.polyfit(truth, est, 1)[0]
+    shrunk_slope = np.polyfit(truth, shrunk, 1)[0]
+    assert 0.85 <= slope <= 1.15, slope
+    assert shrunk_slope < slope            # the ridge estimates ARE shrunk
+    assert 0.85 <= inside / total <= 0.95, inside / total
+
+
+def test_likelihood_measurements_do_not_depend_on_the_prior_mean():
+    """Dividing the prior out must remove it: a box-score-style prior mean
+    changes the ridge estimates but should leave the data-only
+    measurements (nearly) unchanged."""
+    from nbare.rapm.fit import fit_rapm_bayesian, likelihood_measurements
+
+    design, to, td, lam = _planted_fits(300)
+    mu = np.zeros(design.X.shape[1])
+    rng = np.random.default_rng(1)
+    mu[:] = rng.normal(0, 1.5, size=mu.shape)
+    plain = likelihood_measurements(design, fit_rapm(design, fixed_lambda=lam))
+    prior = likelihood_measurements(design, fit_rapm_bayesian(design, mu, fixed_lambda=lam))
+    common = sorted(set(plain.offense) & set(prior.offense))
+    a = np.array([plain.offense[p] for p in common])
+    b = np.array([prior.offense[p] for p in common])
+    assert np.corrcoef(a, b)[0, 1] > 0.97
+    assert np.median(np.abs(a - b)) < 0.3
+
+
+def test_likelihood_measurements_omit_players_with_no_data_beyond_the_prior():
+    from nbare.rapm.fit import likelihood_measurements
+
+    design, to, td, lam = _planted_fits(400, n_games=300)
+    # An enormous lambda makes every posterior ~= the prior: no information.
+    lm = likelihood_measurements(design, fit_rapm(design, fixed_lambda=1e9))
+    assert lm.offense == {} and lm.defense == {}

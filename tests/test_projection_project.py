@@ -97,3 +97,15 @@ def test_offense_and_defense_columns_are_coherent_draws(models):
     np.testing.assert_array_equal(
         proj.defense_samples[:, 0], def_full[:, def_age_pos[target_age]]
     )
+
+
+def test_max_age_truncates_below_the_fitted_grid(models):
+    """Thinly-supported top ages are cut the same way as ages past the grid."""
+    ds, offense, defense = models
+    pid = next(iter(set(offense.result.player_index) & set(defense.result.player_index)))
+    current_age = {pid: ds.age_min}
+    cap = ds.age_min + 2
+    projections = project_players(offense, defense, current_age, years_ahead=4, max_age=cap)
+    assert projections[pid].future_ages == (ds.age_min + 1, ds.age_min + 2)
+    none = project_players(offense, defense, {pid: cap}, years_ahead=4, max_age=cap)
+    assert pid not in none

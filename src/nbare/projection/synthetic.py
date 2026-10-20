@@ -343,6 +343,9 @@ def make_boxscore_baseline_players(
                     player_id=pid, season=f"s{age}", age=age,
                     position_group=pos, off_rating=off, def_rating=defn,
                     off_possessions=poss, def_possessions=poss,
+                    # The noise added above IS N(0, season_noise_sd): its SD
+                    # is known exactly, so record it for known-SE fits.
+                    off_se=season_noise_sd, def_se=season_noise_sd,
                 ))
 
             box_rows[pid] = BoxScoreRow(
@@ -360,4 +363,90 @@ def make_boxscore_baseline_players(
         age_min=age_min, age_max=age_max, sparse_player_ids=sparse_ids,
         rich_player_ids=rich_ids, player_own_shift=player_own_shift,
         true_off_baseline=true_off_baseline, true_def_baseline=true_def_baseline,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class KnownSEPanelDataset:
+    seasons: list[PlayerSeason]
+    sigma_player: float                 # planted per-transition talent-change SD
+    baseline_sd: float                  # planted SD of true level at anchor_age
+    delta_curve_by_position: dict[str, dict[int, float]]
+    true_level: dict[tuple[int, int], float]  # (player_id, age) -> true offense level
+    anchor_age: int
+    age_min: int
+    age_max: int
+
+
+def make_known_se_panel(
+    n_players_per_position: int = 120,
+    age_min: int = 20,
+    age_max: int = 36,
+    anchor_age: int = 27,
+    sigma_player: float = 0.5,
+    baseline_sd: float = 2.0,
+    se_range: tuple[float, float] = (0.3, 1.2),
+    edge_thin: bool = False,
+    seed: int = 0,
+) -> KnownSEPanelDataset:
+    """A panel shaped like the REAL 2023-26 one: every player has only 2-3
+    consecutive seasons, each rating carries a known, varying standard
+    error. Generated exactly as `hierarchy._model` assumes: a true level at
+    `anchor_age` ~ N(0, baseline_sd), and per-transition talent changes =
+    position delta + N(0, sigma_player), cumulated outward from the anchor.
+    This is the regime where a learned-noise model cannot separate
+    sigma_player from measurement noise; with `se_attr` it must recover
+    sigma_player, and with a learned baseline spread, baseline_sd.
+
+    `edge_thin=True` makes careers concentrate mid-grid so the youngest and
+    oldest ages have only a few observations -- the shape of the real
+    panel's 19-21 and 37-41 ages, where an unsmoothed curve swings on noise.
+    """
+    rng = np.random.default_rng(seed)
+    delta_curve_by_position = {
+        pos: planted_position_delta_curve(age_min, age_max, anchor_age, **params)
+        for pos, params in POSITION_SHAPE_PARAMS.items()
+    }
+    seasons: list[PlayerSeason] = []
+    true_lvl: dict[tuple[int, int], float] = {}
+    pid = 0
+    mid, half = (age_min + age_max) / 2, (age_max - age_min) / 2
+    for pos in POSITION_GROUPS:
+        curve = delta_curve_by_position[pos]
+        for _ in range(n_players_per_position):
+            n_seasons = int(rng.integers(2, 4))
+            if edge_thin:
+                start = int(np.clip(round(rng.normal(mid, half / 2.5)),
+                                    age_min, age_max - n_seasons + 1))
+            else:
+                start = int(rng.integers(age_min, age_max - n_seasons + 2))
+            ages = list(range(start, start + n_seasons))
+
+            def walk(base: float) -> dict[int, float]:
+                d = {a: curve[a] + rng.normal(0, sigma_player) for a in range(age_min, age_max)}
+                lvl = {anchor_age: base}
+                for a in range(anchor_age, age_max):
+                    lvl[a + 1] = lvl[a] + d[a]
+                for a in range(anchor_age - 1, age_min - 1, -1):
+                    lvl[a] = lvl[a + 1] - d[a]
+                return lvl
+
+            off_lvl = walk(float(rng.normal(0, baseline_sd)))
+            def_lvl = walk(float(rng.normal(0, baseline_sd)))
+            for age in ages:
+                true_lvl[(pid, age)] = off_lvl[age]
+                off_se = float(rng.uniform(*se_range))
+                def_se = float(rng.uniform(*se_range))
+                seasons.append(PlayerSeason(
+                    player_id=pid, season=f"s{age}", age=age, position_group=pos,
+                    off_rating=off_lvl[age] + rng.normal(0, off_se),
+                    def_rating=def_lvl[age] + rng.normal(0, def_se),
+                    off_possessions=2000.0, def_possessions=2000.0,
+                    off_se=off_se, def_se=def_se,
+                ))
+            pid += 1
+    return KnownSEPanelDataset(
+        seasons=seasons, sigma_player=sigma_player, baseline_sd=baseline_sd,
+        delta_curve_by_position=delta_curve_by_position, true_level=true_lvl,
+        anchor_age=anchor_age, age_min=age_min, age_max=age_max,
     )

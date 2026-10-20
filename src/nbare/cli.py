@@ -111,6 +111,21 @@ def ingest_box_cmd(
     console.print(f"[green]box score rows: {n:,}")
 
 
+@app.command("ingest-bio")
+def ingest_bio_cmd(
+    seasons: str = typer.Option(
+        "2023-24,2024-25,2025-26", help="comma-separated seasons"
+    ),
+) -> None:
+    """Per-season player ages + positions for Stage 3 projections (two
+    league-wide requests per season; cached, so rerun freely)."""
+    from nbare.ingest.nba_stats import ingest_player_bio
+
+    season_list = [s.strip() for s in seasons.split(",")]
+    n = ingest_player_bio(season_list)
+    console.print(f"[green]bio responses cached: {n} ({len(season_list)} seasons)")
+
+
 @app.command("ingest-contracts")
 def ingest_contracts_cmd(
     path: str = typer.Argument(..., help="Basketball-Reference contract CSV"),
@@ -1031,6 +1046,274 @@ def check_minutes_cmd(
         f"[{color}]minutes gate: {passed}/{total} games passed"
         + ("" if failed == 0 else f" -- {failed} FAILED, do not build RAPM yet")
     )
+
+
+
+# Max R-hat a projection fit may have and still be exported. 1.01 is the
+# modern strict bar (Vehtari et al. 2021); 1.05 is the older, looser one.
+# Above this the chains disagree and the posterior is not trustworthy.
+MAX_RHAT = 1.05
+
+# An age needs this many observed player-seasons in the panel before
+# projections may land on it. On 2023-26, ages 39-41 had only a few each;
+# the curve there is mostly prior, so those ages are truncated, not shown.
+MIN_PLAYER_SEASONS_PER_AGE = 15
+
+
+@app.command("export-projections")
+def export_projections_cmd(
+    seasons: str = typer.Option(
+        "2023-24,2024-25,2025-26",
+        help="comma-separated seasons forming the per-season RAPM panel",
+    ),
+    years_ahead: int = typer.Option(4, help="project this many seasons forward"),
+    anchor_age: int = typer.Option(27, help="age at which a player's baseline is pinned"),
+    num_warmup: int = typer.Option(1500),
+    num_samples: int = typer.Option(1500),
+    num_chains: int = typer.Option(4, help="run in parallel, one CPU device each"),
+    max_rhat: float = typer.Option(MAX_RHAT, help="refuse to export above this"),
+    backtest: bool = typer.Option(
+        True, help="also fit WITHOUT the last season and score how often its "
+        "actual ratings fall inside the 80% predictive band",
+    ),
+    out_dir: str = typer.Option("app/data", help="output directory"),
+) -> None:
+    """Stage 3 on real data: per-season RAPM panel -> hierarchical aging
+    curves (offense and defense separately) -> projections.csv.
+
+    1. Fit each season ON ITS OWN (minutes gate + box-score prior). The
+       pooled fit cannot be used: it assumes a player is the same in every
+       season, which erases exactly the age signal being modeled.
+    2. Join ratings with per-season ages and positions (`ingest-bio`) into
+       a PlayerSeason panel (projection/panel.py).
+    3. Fit layers 1-3 (delta-method curve, player->position->league
+       pooling, box-score baseline) for offense and for defense.
+       Each observation is that season's PRIOR-DIVIDED measurement with
+       its standard error (rapm.fit.likelihood_measurements), used as KNOWN
+       measurement error: with <=3 seasons per player a model that must
+       learn the noise cannot separate it from real talent change and never
+       converges (see hierarchy.py), and the shrunk ridge estimates would
+       count the prior twice.
+    4. Check convergence: if any site's R-hat exceeds --max-rhat, export
+       NOTHING. A hierarchical model that silently fails to converge is
+       the specific risk docs/stage3_spec.md names.
+    4b. Backtest (--backtest): refit on every season but the last, predict
+       the last, and record 80%-band coverage of the ACTUAL ratings --
+       out-of-sample evidence the app's bands mean what they say.
+    5. Project players with a row in the LAST season (known to be active)
+       1..years_ahead seasons forward and write median + 80% interval.
+       Ages past the fitted age grid -- or above the oldest age with
+       MIN_PLAYER_SEASONS_PER_AGE observations -- are truncated, never
+       extrapolated. Player-level spread (sigma_baseline) and the league
+       curve's smoothness are learned, not fixed (see hierarchy._model).
+    """
+    from datetime import datetime, timezone
+
+    import numpyro
+
+    numpyro.set_host_device_count(num_chains)  # parallel chains; before JAX starts
+
+    from nbare.export import (
+        PROJECTIONS_COLUMNS,
+        projection_rows,
+        update_meta_projections,
+        write_csv,
+    )
+    from nbare.ingest.nba_stats import box_detail_from_cache, player_bio_from_cache
+    from nbare.projection.baseline import fit_box_score_projection
+    from nbare.projection.panel import SeasonRatings, build_panel
+    from nbare.projection.project import project_players
+    from nbare.rapm.blocks import blocks_from_warehouse
+    from nbare.rapm.box_features import box_score_rows
+    from nbare.rapm.design import build_design
+    from nbare.rapm.fit import (
+        REPLACEMENT_LEVEL,
+        player_side_possessions,
+        likelihood_measurements,
+    )
+
+    season_list = sorted(s.strip() for s in seasons.split(","))
+    last_season = season_list[-1]
+
+    ages, positions, missing_bio = player_bio_from_cache(season_list)
+    if missing_bio:
+        console.print(
+            f"[red]no cached ages/positions for {missing_bio}; run "
+            f"`nbare ingest-bio --seasons {','.join(season_list)}` first."
+        )
+        raise typer.Exit(1)
+
+    season_ratings: list[SeasonRatings] = []
+    all_game_ids: list[str] = []
+    with session() as con:
+        names = {
+            r[0]: r[1]
+            for r in con.execute("SELECT nba_player_id, full_name FROM stg.player").fetchall()
+        }
+        for s in season_list:
+            game_ids = [r[0] for r in con.execute(
+                "SELECT game_id FROM stg.game WHERE season = ? ORDER BY game_date", [s]
+            ).fetchall()]
+            if not game_ids:
+                console.print(f"[red]no games in warehouse for {s}")
+                raise typer.Exit(1)
+            all_game_ids.extend(game_ids)
+            console.print(f"[{s}] gating + single-season fit...")
+            res = blocks_from_warehouse(con, game_ids)
+            design = build_design(res.blocks)
+            fit, _ = _fit_with_prior(design, "box", game_ids, REPLACEMENT_LEVEL)
+            off_p, def_p = player_side_possessions(design)
+            lm = likelihood_measurements(design, fit)
+            season_ratings.append(SeasonRatings(
+                season=s, offense=lm.offense, defense=lm.defense,
+                off_possessions=off_p, def_possessions=def_p,
+                off_se=lm.offense_se, def_se=lm.defense_se,
+            ))
+
+    panel = build_panel(season_ratings, ages, positions)
+    n_players = len({r.player_id for r in panel.seasons})
+    console.print(
+        f"panel: {len(panel.seasons):,} player-seasons / {n_players:,} players "
+        f"(dropped: {panel.dropped_low_possessions:,} low-possession rows, "
+        f"{panel.dropped_no_age:,} rows with no age, "
+        f"{panel.dropped_no_measurement:,} rows with no data-only measurement, "
+        f"{panel.dropped_age_inconsistent_players} players with inconsistent ages; "
+        f"{panel.unknown_position_players} players in the unknown-position group)"
+    )
+    if not panel.seasons:
+        console.print("[red]empty panel; nothing to fit.")
+        raise typer.Exit(1)
+
+    detail, _missing = box_detail_from_cache(all_game_ids)
+    box_rows = {r.player_id: r for r in box_score_rows(detail).rows}
+
+    panel_ages = [r.age for r in panel.seasons]
+    age_min, age_max = min(panel_ages), max(panel_ages)
+    anchor = min(max(anchor_age, age_min), age_max)
+    console.print(
+        f"age grid {age_min}..{age_max}, anchor {anchor}; sampling {num_chains}x"
+        f"({num_warmup}+{num_samples})..."
+    )
+
+    def fit_sides(rows):
+        # Box baseline trains on players with every season in `rows`
+        # (3 for the full panel, 2 for the backtest's training panel).
+        reliable = min(3, len({r.season for r in rows}))
+        out = {}
+        for side, rating, weight, se in (
+            ("offense", "off_rating", "off_possessions", "off_se"),
+            ("defense", "def_rating", "def_possessions", "def_se"),
+        ):
+            out[side] = fit_box_score_projection(
+                rows, box_rows, rating, weight,
+                age_min=age_min, age_max=age_max, anchor_age=anchor,
+                reliable_seasons=reliable, se_attr=se,
+                baseline_prior_sd=None, smooth_league_curve=True,
+                prelim_num_warmup=num_warmup, prelim_num_samples=num_samples,
+                num_warmup=num_warmup, num_samples=num_samples,
+                num_chains=num_chains, seed=0,
+            )
+        return out
+
+    models = fit_sides(panel.seasons)
+    diagnostics = {}
+    for side, m in models.items():
+        rhat = m.result.r_hat_summary()
+        worst = max(v for v in rhat.values() if v == v)  # skip NaN
+        diagnostics[side] = {
+            "max_rhat": worst, "rhat_by_site": rhat,
+            "box_baseline_trained_on": m.reliable_n, "notes": m.notes,
+            "sigma_player_mean": float(m.result.samples["sigma_player"].mean()),
+            "sigma_baseline_mean": float(m.result.samples["sigma_baseline"].mean()),
+        }
+        console.print(
+            f"{side}: max R-hat {worst:.3f}, year-to-year talent SD "
+            f"{diagnostics[side]['sigma_player_mean']:.2f} pts/100, level spread "
+            f"{diagnostics[side]['sigma_baseline_mean']:.2f}, "
+            f"box baseline trained on {m.reliable_n} players"
+            + "".join(f"\n  [yellow]note: {n}" for n in m.notes)
+        )
+
+    bad = {k: d["max_rhat"] for k, d in diagnostics.items() if d["max_rhat"] > max_rhat}
+    if bad:
+        console.print(
+            f"[red]NOT CONVERGED (R-hat > {max_rhat}): {bad}. Nothing exported -- "
+            "rerun with more --num-warmup/--num-samples."
+        )
+        raise typer.Exit(1)
+
+    backtest_info = None
+    if backtest and len(season_list) > 2:
+        train = [r for r in panel.seasons if r.season != last_season]
+        held = [r for r in panel.seasons if r.season == last_season]
+        console.print(
+            f"backtest: refit without {last_season} ({len(train):,} rows), "
+            f"predict its {len(held):,} actual ratings..."
+        )
+        bt = fit_sides(train)
+        backtest_info = {"held_out_season": last_season}
+        for side, rating, se in (("offense", "off_rating", "off_se"),
+                                 ("defense", "def_rating", "def_se")):
+            cov, n = bt[side].result.holdout_coverage(held, rating, se, prob=0.8)
+            bt_rhat = max(v for v in bt[side].result.r_hat_summary().values() if v == v)
+            backtest_info[side] = {"coverage_80": cov, "n_scored": n, "max_rhat": bt_rhat}
+            console.print(
+                f"  {side}: {cov:.1%} of {n:,} actual {last_season} ratings inside "
+                f"the 80% band (backtest max R-hat {bt_rhat:.3f})"
+            )
+
+    # Current age = age in the last season; only players observed in it.
+    current_age = {
+        r.player_id: r.age for r in panel.seasons if r.season == last_season
+    }
+    age_counts: dict[int, int] = {}
+    for r in panel.seasons:
+        age_counts[r.age] = age_counts.get(r.age, 0) + 1
+    max_supported = anchor
+    while age_counts.get(max_supported + 1, 0) >= MIN_PLAYER_SEASONS_PER_AGE:
+        max_supported += 1
+    console.print(
+        f"projections capped at age {max_supported} (oldest age with "
+        f">= {MIN_PLAYER_SEASONS_PER_AGE} player-seasons, counting up from {anchor})"
+    )
+    projections = project_players(
+        models["offense"], models["defense"], current_age,
+        years_ahead=years_ahead, max_age=max_supported,
+    )
+    rows = projection_rows(projections, names, current_age, last_season)
+    truncated = sum(1 for p in projections.values() if len(p.future_ages) < years_ahead)
+
+    out = Path(out_dir)
+    write_csv(rows, PROJECTIONS_COLUMNS, out / "projections.csv")
+    console.print(
+        f"[green]wrote {out / 'projections.csv'} ({len(rows):,} rows, "
+        f"{len({r['player_id'] for r in rows}):,} players; {truncated} truncated "
+        "at the top of the age grid)"
+    )
+    update_meta_projections(out / "meta.json", {
+        "status": "built",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "seasons_used": season_list,
+        "projected_from": last_season,
+        "years_ahead": years_ahead,
+        "n_panel_rows": len(panel.seasons),
+        "n_players_in_fit": n_players,
+        "n_players_projected": len({r["player_id"] for r in rows}),
+        "age_grid": [age_min, age_max],
+        "anchor_age": anchor,
+        "max_projected_age": max_supported,
+        "min_player_seasons_per_age": MIN_PLAYER_SEASONS_PER_AGE,
+        "interval": "80% central posterior interval of total RAPM (10th-90th pct)",
+        "sampler": {"num_warmup": num_warmup, "num_samples": num_samples,
+                    "num_chains": num_chains},
+        "diagnostics": diagnostics,
+        "backtest": backtest_info,
+        "measurement_error": "known: single-season RAPM with the ridge prior "
+                             "divided out, per-rating standard error",
+        "model": "delta-method aging curve + player/position/league partial "
+                 "pooling + box-score baseline (numpyro NUTS)",
+    })
+    console.print(f"[green]updated {out / 'meta.json'} (projection keys only)")
 
 
 if __name__ == "__main__":

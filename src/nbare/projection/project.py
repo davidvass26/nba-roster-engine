@@ -50,6 +50,7 @@ def project_players(
     defense_model: BoxScoreProjectionModel,
     current_age_by_player: dict[int, int],
     years_ahead: int = 4,
+    max_age: int | None = None,
 ) -> dict[int, PlayerProjection]:
     """Project offense and defense RAPM forward for every player present in
     BOTH fitted models and `current_age_by_player`.
@@ -59,6 +60,13 @@ def project_players(
     callers who need a projection for such a player must fit them into the
     hierarchy first (even a single season is enough to enter the fit and
     be pooled toward his position curve).
+
+    `max_age` caps projections below the fitted grid's own top: the grid
+    spans every observed age, but its oldest ages may rest on a handful of
+    player-seasons (on the real 2023-26 panel, ages 39-41 had a few each),
+    where the curve is mostly prior. Callers pass the oldest age with
+    adequate support; ages above it are truncated exactly like ages past
+    the grid -- not projected, not guessed.
     """
     off_result = offense_model.result
     def_result = defense_model.result
@@ -74,7 +82,8 @@ def project_players(
     for pid in sorted(common_ids):
         current_age = current_age_by_player[pid]
         requested_ages = [current_age + y for y in range(1, years_ahead + 1)]
-        covered_ages = [a for a in requested_ages if a in off_age_pos and a in def_age_pos]
+        covered_ages = [a for a in requested_ages if a in off_age_pos and a in def_age_pos
+                        and (max_age is None or a <= max_age)]
         if not covered_ages:
             continue
 

@@ -681,6 +681,117 @@ def box_detail_from_cache(
     return detail, missing
 
 
+# --- player bio: per-season age + position group ---------------------------
+# Stage 3 projections need every player-season's AGE and every player's
+# position GROUP, and stg.player has neither (birthdate/position are empty
+# for all rows -- CommonAllPlayers does not carry them). Two league-wide
+# endpoints supply them in one request per season each, instead of ~800
+# per-player CommonPlayerInfo calls:
+#
+#   LeagueDashPlayerStats(season)  -> AGE per player for that season.
+#     Verified against known birthdates: LeBron 39/40/41 and Curry
+#     36/37/38 for 2023-24/2024-25/2025-26, i.e. nba.com's AGE behaves like
+#     age at season END (Curry turns a year older in March). The exact
+#     convention matters less than that it is applied the same way every
+#     season, so consecutive seasons differ by exactly 1 -- what the delta
+#     method needs; projection/panel.py checks that per player.
+#   PlayerIndex(season)            -> POSITION ("G", "F-C", ...). Past
+#     seasons' indexes only list ~140 players, the current one ~580, so
+#     the most recent season that lists a player wins.
+
+def parse_player_ages(payload: dict[str, Any]) -> dict[int, int]:
+    """LeagueDashPlayerStats payload -> {player_id: age}. A null age is
+    left out (unknown), never defaulted."""
+    df = result_set_to_df(payload)
+    if df.is_empty() or "age" not in df.columns:
+        return {}
+    return {
+        int(pid): int(age)
+        for pid, age in df.select("player_id", "age").iter_rows()
+        if pid is not None and age is not None
+    }
+
+
+def position_group(position: str | None) -> str | None:
+    """nba.com position string -> coarse group for trajectory pooling.
+
+    The FIRST listed position wins ("G-F" -> "G", "F-C" -> "F", "C-F" ->
+    "C"): nba.com lists a player's primary position first. Empty/unknown
+    -> None, which callers must keep distinct from any real group.
+
+    >>> [position_group(p) for p in ("G", "G-F", "F-C", "C-F", "", None)]
+    ['G', 'G', 'F', 'C', None, None]
+    """
+    if not position:
+        return None
+    head = position.strip().split("-")[0].upper()
+    return head if head in ("G", "F", "C") else None
+
+
+def parse_player_positions(payload: dict[str, Any]) -> dict[int, str]:
+    """PlayerIndex payload -> {player_id: position group}; players with no
+    usable position are left out."""
+    df = result_set_to_df(payload)
+    if df.is_empty() or "position" not in df.columns:
+        return {}
+    out: dict[int, str] = {}
+    for pid, pos in df.select("person_id", "position").iter_rows():
+        g = position_group(pos)
+        if pid is not None and g is not None:
+            out[int(pid)] = g
+    return out
+
+
+def _bio_requests(season: str) -> list[tuple[Any, dict[str, Any]]]:
+    from nba_api.stats.endpoints import leaguedashplayerstats, playerindex
+
+    return [
+        (leaguedashplayerstats.LeagueDashPlayerStats,
+         {"season": season, "season_type_all_star": "Regular Season"}),
+        (playerindex.PlayerIndex, {"season": season, "league_id": "00"}),
+    ]
+
+
+def ingest_player_bio(seasons: Iterable[str], cache: NBAStatsCache | None = None) -> int:
+    """Fetch (through the cached, rate-limited client) the two bio
+    endpoints for each season. Returns the number of responses now cached.
+    Resumable for free: already-cached seasons are cache hits."""
+    n = 0
+    for season in seasons:
+        for cls, params in _bio_requests(season):
+            fetch(cls, params, cache=cache)
+            n += 1
+    return n
+
+
+def player_bio_from_cache(
+    seasons: list[str], cache: NBAStatsCache | None = None
+) -> tuple[dict[tuple[int, str], int], dict[int, str], list[str]]:
+    """(ages keyed by (player_id, season), position group by player_id,
+    seasons missing a cached bio response). Cache ONLY -- never fetches;
+    run `nbare ingest-bio` first. Positions: the latest season listing a
+    player wins (see the note above)."""
+    from nbare.ingest.client import request_hash
+
+    if cache is None:
+        cache = NBAStatsCache()
+    ages: dict[tuple[int, str], int] = {}
+    positions: dict[int, str] = {}
+    missing: list[str] = []
+    for season in sorted(seasons):
+        (age_cls, age_params), (idx_cls, idx_params) = _bio_requests(season)
+        age_hit = cache.get(request_hash(age_cls.__name__, age_params))
+        idx_hit = cache.get(request_hash(idx_cls.__name__, idx_params))
+        if age_hit is None or idx_hit is None:
+            missing.append(season)
+        if age_hit is not None:
+            for pid, age in parse_player_ages(age_hit["payload"]).items():
+                ages[(pid, season)] = age
+        if idx_hit is not None:
+            positions.update(parse_player_positions(idx_hit["payload"]))
+    return ages, positions, missing
+
+
 def ingest_box_scores(con, game_ids: Iterable[str], cache: NBAStatsCache | None = None) -> int:
     """Traditional box score for a list of games.
 

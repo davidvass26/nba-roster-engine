@@ -56,7 +56,7 @@ LAST_SEASON_COLUMNS = [
 RAPM_LEADERBOARD_WITH_LAST_COLUMNS = RAPM_LEADERBOARD_COLUMNS + LAST_SEASON_COLUMNS
 
 PROJECTIONS_COLUMNS = [
-    "player_id", "name", "season", "proj_offense", "proj_defense",
+    "player_id", "name", "season", "age", "proj_offense", "proj_defense",
     "proj_total", "lower_80", "upper_80",
 ]
 
@@ -120,6 +120,61 @@ def add_last_season(rows: list[dict], last: Any) -> list[dict]:
             extra = {c: None for c in LAST_SEASON_COLUMNS}
         out.append({**r, **extra})
     return out
+
+
+def projection_rows(
+    projections: dict[int, Any],
+    names: dict[int, str],
+    current_age: dict[int, int],
+    current_season: str,
+) -> list[dict]:
+    """Summarize `project.project_players` output to one row per player per
+    projected season: posterior MEDIAN offense/defense/total plus the 80%
+    central interval (10th-90th percentile) of TOTAL.
+
+    Total is summed per posterior draw (offense draw s + defense draw s)
+    BEFORE taking quantiles -- `PlayerProjection` guarantees same-index
+    draws are coherent pairs, and quantiles do not add (the 10th
+    percentile of a sum is not the sum of 10th percentiles). Unnamed
+    players are dropped, as in the leaderboard. Rows are ordered by
+    player name, then season.
+    """
+    import numpy as np
+
+    from nbare.projection.panel import next_season
+
+    rows = []
+    for pid, proj in projections.items():
+        name = names.get(pid)
+        if not name:
+            continue
+        total = proj.offense_samples + proj.defense_samples  # (S, n_ages)
+        for k, age in enumerate(proj.future_ages):
+            t = total[:, k]
+            rows.append({
+                "player_id": pid,
+                "name": name,
+                "season": next_season(current_season, age - current_age[pid]),
+                "age": age,
+                "proj_offense": float(np.median(proj.offense_samples[:, k])),
+                "proj_defense": float(np.median(proj.defense_samples[:, k])),
+                "proj_total": float(np.median(t)),
+                "lower_80": float(np.quantile(t, 0.10)),
+                "upper_80": float(np.quantile(t, 0.90)),
+            })
+    rows.sort(key=lambda r: (r["name"], r["season"]))
+    return rows
+
+
+def update_meta_projections(path: Path, info: dict) -> dict:
+    """Rewrite ONLY the projection keys of an existing meta.json (the RAPM
+    provenance written by `export-app-data` is left untouched), so the two
+    exports can run independently."""
+    meta = json.loads(path.read_text()) if path.exists() else {}
+    meta["projections_status"] = info.get("status", "built")
+    meta["projections"] = info
+    write_meta_json(meta, path)
+    return meta
 
 
 def write_csv(rows: list[dict], columns: list[str], path: Path) -> None:

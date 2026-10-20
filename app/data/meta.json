@@ -11,12 +11,100 @@
   "points_per_win": 30.0,
   "generated_at": "2026-10-19T21:53:13.003886+00:00",
   "fit_type": "pooled multi-season ridge RAPM with box-score prior",
-  "projections_status": "not yet built: no real-data projections pipeline exists (Stage 3's delta/hierarchy/baseline layers are validated only on synthetic data so far). This file has headers only, zero rows.",
+  "projections_status": "built",
   "last_season": {
     "season": "2025-26",
     "n_games": 1060,
     "n_stints": 34219,
     "lambda": 8000.0,
     "fit_type": "single-season ridge RAPM with box-score prior"
+  },
+  "projections": {
+    "status": "built",
+    "generated_at": "2026-10-20T00:17:41.354348+00:00",
+    "seasons_used": [
+      "2023-24",
+      "2024-25",
+      "2025-26"
+    ],
+    "projected_from": "2025-26",
+    "years_ahead": 4,
+    "n_panel_rows": 1341,
+    "n_players_in_fit": 614,
+    "n_players_projected": 436,
+    "age_grid": [
+      19,
+      41
+    ],
+    "anchor_age": 27,
+    "max_projected_age": 36,
+    "min_player_seasons_per_age": 15,
+    "interval": "80% central posterior interval of total RAPM (10th-90th pct)",
+    "sampler": {
+      "num_warmup": 1500,
+      "num_samples": 1500,
+      "num_chains": 4
+    },
+    "diagnostics": {
+      "offense": {
+        "max_rhat": 1.01,
+        "rhat_by_site": {
+          "baseline": 1.0,
+          "baseline_raw": 1.0,
+          "league_delta": 1.0,
+          "league_delta_first": 1.0,
+          "league_delta_steps": 1.0,
+          "player_delta": 1.0,
+          "player_delta_raw": 1.01,
+          "position_delta": 1.0,
+          "position_delta_raw": 1.0,
+          "sigma_baseline": 1.0,
+          "sigma_player": 1.0,
+          "sigma_position": 1.0,
+          "tau_league": 1.0
+        },
+        "box_baseline_trained_on": 289,
+        "notes": [],
+        "sigma_player_mean": 0.08655592799186707,
+        "sigma_baseline_mean": 2.0948941707611084
+      },
+      "defense": {
+        "max_rhat": 1.01,
+        "rhat_by_site": {
+          "baseline": 1.0,
+          "baseline_raw": 1.01,
+          "league_delta": 1.0,
+          "league_delta_first": 1.0,
+          "league_delta_steps": 1.0,
+          "player_delta": 1.0,
+          "player_delta_raw": 1.01,
+          "position_delta": 1.0,
+          "position_delta_raw": 1.0,
+          "sigma_baseline": 1.0,
+          "sigma_player": 1.0,
+          "sigma_position": 1.0,
+          "tau_league": 1.0
+        },
+        "box_baseline_trained_on": 289,
+        "notes": [],
+        "sigma_player_mean": 0.09208213537931442,
+        "sigma_baseline_mean": 2.1265625953674316
+      }
+    },
+    "backtest": {
+      "held_out_season": "2025-26",
+      "offense": {
+        "coverage_80": 0.7891891891891892,
+        "n_scored": 370,
+        "max_rhat": 1.01
+      },
+      "defense": {
+        "coverage_80": 0.8027027027027027,
+        "n_scored": 370,
+        "max_rhat": 1.01
+      }
+    },
+    "measurement_error": "known: single-season RAPM with the ridge prior divided out, per-rating standard error",
+    "model": "delta-method aging curve + player/position/league partial pooling + box-score baseline (numpyro NUTS)"
   }
 }

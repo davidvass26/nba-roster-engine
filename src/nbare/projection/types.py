@@ -26,7 +26,9 @@ class PlayerSeason:
     `off_rating`/`def_rating` are RAPM-scale ratings (points per 100
     possessions, "good is positive" -- same convention as `RAPMResult`).
     `off_possessions`/`def_possessions` size the observation's reliability;
-    they are used as regression weights, never dropped silently.
+    they are used as regression weights, never dropped silently. When
+    `off_se`/`def_se` are present they replace that weighting with the
+    rating's actual standard error.
     """
 
     player_id: int
@@ -37,3 +39,9 @@ class PlayerSeason:
     def_rating: float
     off_possessions: float
     def_possessions: float
+    # Known measurement error of off_rating/def_rating (pts/100): the
+    # single-season RAPM fit's posterior SD (`rapm.fit.rapm_standard_errors`).
+    # None = unknown, in which case the hierarchy learns a possession-scaled
+    # noise term instead. See hierarchy.py on why known SEs matter.
+    off_se: float | None = None
+    def_se: float | None = None

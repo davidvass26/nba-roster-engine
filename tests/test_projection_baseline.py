@@ -28,7 +28,14 @@ def offense_fit():
         ds.seasons, ds.box_rows, "off_rating", "off_possessions",
         age_min=ds.age_min, age_max=ds.age_max, anchor_age=ds.anchor_age,
         prelim_num_warmup=300, prelim_num_samples=300,
-        num_warmup=500, num_samples=500, num_chains=2, seed=0,
+        # Known measurement error, as in the real pipeline. With LEARNED
+        # noise (no se_attr) obs_sigma did not reliably converge here even
+        # at 4 x 1000 draws (R-hat 1.08-1.23 across seeds); it only ever
+        # passed at 2 x 500 on one lucky random stream. That is the same
+        # noise/talent-change confounding the real panel hit -- see
+        # hierarchy.fit_hierarchical_curve's `se_attr`.
+        num_warmup=500, num_samples=500, num_chains=4, seed=0,
+        se_attr="off_se",
     )
     return ds, model
 

@@ -69,23 +69,30 @@ def fit_box_score_projection(
     age_max: int,
     anchor_age: int,
     reliable_seasons: float = DEFAULT_RELIABLE_SEASONS,
-    baseline_prior_sd: float = 6.0,
+    baseline_prior_sd: float | None = 6.0,
     prelim_num_warmup: int = 400,
     prelim_num_samples: int = 400,
     num_warmup: int = 600,
     num_samples: int = 600,
     num_chains: int = 2,
     seed: int = 0,
+    se_attr: str | None = None,
+    smooth_league_curve: bool = False,
 ) -> BoxScoreProjectionModel:
     """Fit the box-score-informed hierarchy for one side (offense or
-    defense -- pick `rating_attr`/`weight_attr`/`features` accordingly)."""
+    defense -- pick `rating_attr`/`weight_attr`/`features` accordingly).
+    `se_attr` passes known rating SEs through to both hierarchy fits (see
+    `hierarchy.fit_hierarchical_curve`), as does `smooth_league_curve`.
+    `baseline_prior_sd=None` learns the final fit's baseline spread around
+    the box-score prediction instead of fixing it."""
     features = OFFENSE_FEATURES if rating_attr == "off_rating" else DEFENSE_FEATURES
 
     prelim = fit_hierarchical_curve(
         seasons, rating_attr, weight_attr, age_min=age_min, age_max=age_max,
         anchor_age=anchor_age, baseline_prior_mean=None, baseline_prior_sd=20.0,
         num_warmup=prelim_num_warmup, num_samples=prelim_num_samples,
-        num_chains=num_chains, seed=seed,
+        num_chains=num_chains, seed=seed, se_attr=se_attr,
+        smooth_league_curve=smooth_league_curve,
     )
     prelim_baseline_mean = {
         pid: float(prelim.samples["baseline"][:, i].mean())
@@ -126,6 +133,7 @@ def fit_box_score_projection(
         anchor_age=anchor_age, baseline_prior_mean=predicted_mean,
         baseline_prior_sd=baseline_prior_sd, num_warmup=num_warmup,
         num_samples=num_samples, num_chains=num_chains, seed=seed,
+        se_attr=se_attr, smooth_league_curve=smooth_league_curve,
     )
 
     return BoxScoreProjectionModel(

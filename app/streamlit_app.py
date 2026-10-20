@@ -391,19 +391,104 @@ with tab_proj:
         if status:
             st.caption(f"From meta.json: {status}")
     else:
+        pinfo = meta.get("projections") or {}
         players = sorted(proj["name"].unique().to_list())
-        pick = st.selectbox("Player", players, key="proj_player")
-        pdf = proj.filter(pl.col("name") == pick).sort("season").to_pandas()
-        band = alt.Chart(pdf).mark_area(opacity=0.25).encode(
-            x=alt.X("season:N", title="Season"),
-            y=alt.Y("lower_80:Q", title="Projected total RAPM"),
-            y2="upper_80:Q",
+        default_player = "Victor Wembanyama"
+        pick = st.selectbox(
+            "Player", players,
+            index=players.index(default_player) if default_player in players else 0,
+            key="proj_player",
         )
-        line = alt.Chart(pdf).mark_line(point=True).encode(
+        pdf = proj.filter(pl.col("name") == pick).sort("season")
+        cap = pinfo.get("max_projected_age")
+        st.caption(
+            f"{len(players):,} players projected: everyone with a measurable "
+            f"{pinfo.get('projected_from', 'last-season')} rating"
+            + (f", up to age {cap} — too few players have been observed past "
+               f"{cap} to estimate the aging curve there, so older players "
+               "(and later seasons for players nearing it) are left out, not "
+               "guessed" if cap else "")
+            + "."
+        )
+
+        first_season = proj["season"].min()
+        nxt = proj.filter(pl.col("season") == first_season).sort("proj_total", descending=True)
+        names_ranked = nxt["name"].to_list()
+        if pick in names_ranked:
+            st.caption(
+                f"Projected #{names_ranked.index(pick) + 1} of {len(names_ranked):,} "
+                f"players for {first_season} (by median total)."
+            )
+
+        chart_df = pdf.to_pandas()
+        band = alt.Chart(chart_df).mark_area(opacity=0.25).encode(
+            x=alt.X("season:N", title="Season"),
+            y=alt.Y("lower_80:Q", title="Projected total RAPM (pts/100)"),
+            y2="upper_80:Q",
+            tooltip=["season", "age",
+                     alt.Tooltip("proj_total:Q", format="+.1f", title="median"),
+                     alt.Tooltip("lower_80:Q", format="+.1f", title="80% low"),
+                     alt.Tooltip("upper_80:Q", format="+.1f", title="80% high")],
+        )
+        line = alt.Chart(chart_df).mark_line(point=True).encode(
             x="season:N", y="proj_total:Q",
         )
-        st.altair_chart((band + line).properties(height=320), width="stretch")
-        st.caption("Shaded band is the 80% posterior interval — the point estimate alone is never shown.")
+        zero = alt.Chart(chart_df).mark_rule(strokeDash=[4, 4], opacity=0.4).encode(
+            y=alt.datum(0)
+        )
+        st.altair_chart((band + line + zero).properties(height=320), width="stretch")
+
+        st.dataframe(
+            pdf.select("season", "age", "proj_total", "lower_80", "upper_80",
+                       "proj_offense", "proj_defense")
+            .rename({"season": "Season", "age": "Age", "proj_total": "Total (median)",
+                     "lower_80": "80% low", "upper_80": "80% high",
+                     "proj_offense": "Off (median)", "proj_defense": "Def (median)"}),
+            width="stretch", hide_index=True,
+            column_config={c: st.column_config.NumberColumn(format="%+.1f") for c in
+                           ("Total (median)", "80% low", "80% high",
+                            "Off (median)", "Def (median)")},
+        )
+        if len(pdf) < pinfo.get("years_ahead", len(pdf)):
+            st.caption(
+                "Fewer seasons than requested: the aging curve is only fit up "
+                f"to age {pinfo.get('age_grid', ['?', '?'])[1]}, and this "
+                "engine truncates rather than extrapolating past it."
+            )
+
+        diag = pinfo.get("diagnostics", {})
+        rhat = ", ".join(f"{k} {v.get('max_rhat', float('nan')):.3f}" for k, v in diag.items())
+        bt = pinfo.get("backtest") or {}
+        bt_text = ""
+        if bt.get("offense") and bt.get("defense"):
+            bt_text = (
+                f"**Backtest:** refit without {bt['held_out_season']} and predict it — "
+                f"the 80% band contained {bt['offense']['coverage_80']:.0%} of actual "
+                f"offensive and {bt['defense']['coverage_80']:.0%} of actual defensive "
+                f"{bt['held_out_season']} ratings ({bt['offense']['n_scored']:,} players). "
+            )
+        st.info(
+            "**How to read this.** The line is the median projection of the "
+            "player's underlying rating; the shaded band is its 80% posterior "
+            "interval — never a bare point estimate. Model: hierarchical "
+            "Bayesian aging curve (delta method, so survivorship cannot bias "
+            "it), partially pooled player → position → league, with a "
+            "box-score-informed baseline; offense and defense projected "
+            "separately. Each season's rating enters as a measurement with "
+            "its own standard error (single-season RAPM with the ridge prior "
+            f"divided out), from {', '.join(pinfo.get('seasons_used', []))} "
+            f"({pinfo.get('n_panel_rows', 0):,} player-seasons). "
+            f"Convergence: max R-hat {rhat}. " + bt_text +
+            "**Scale:** these are the projection model's estimates of "
+            "underlying talent, which are shrunk far less than the Impact "
+            "tab's ridge RAPM (a ridge fit pulls everyone hard toward zero; "
+            "this model learns its own, weaker pooling from the data). So "
+            "compare players within this tab — ranks, bands, trajectories — "
+            "not against the leaderboard's numbers. "
+            "**Limits:** three seasons of history (≤2 age transitions per "
+            "player), so bands are wide; no retirement, injury, or "
+            "playing-time modeling yet (v2)."
+        )
 
 # --- Optimizer (coming soon) -----------------------------------------------
 with tab_opt:

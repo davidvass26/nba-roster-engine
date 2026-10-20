@@ -143,6 +143,10 @@ class RAPMResult:
     value: dict[int, float]        # player_id -> points above replacement (see compute_value)
     wins_added: dict[int, float]   # player_id -> value / POINTS_PER_WIN
     replacement_level: float       # the replacement_level value used above
+    # Ridge prior mean over the design's 2P columns: None = zero (plain
+    # ridge); set by fit_rapm_bayesian. Needed to divide the prior back out
+    # of the posterior (see `likelihood_measurements`).
+    prior_mean: np.ndarray | None = None
 
     def total(self, player_id: int) -> float:
         """Combined RAPM: offense plus defense (both in 'good is positive')."""
@@ -335,6 +339,7 @@ def fit_rapm_bayesian(
         value=value,
         wins_added=wins_added,
         replacement_level=replacement_level,
+        prior_mean=prior_mu,
     )
 
 
@@ -361,3 +366,113 @@ class OnOffDefense:
     def diff(self) -> float:
         """on minus off; negative == defends better on the floor."""
         return self.opp_pts_100_on - self.opp_pts_100_off
+
+def _posterior_variance(design: DesignMatrix, result: RAPMResult) -> tuple[np.ndarray, float]:
+    """(diag of the ridge posterior covariance over all 2P columns, sigma^2).
+    See `rapm_standard_errors` for the derivation."""
+    X = design.X.tocsr()
+    w = design.w
+    n_cols = X.shape[1]
+    coef = np.zeros(n_cols)
+    for pid, i in design.player_index.items():
+        coef[2 * i] = result.offense[pid]
+        coef[2 * i + 1] = result.defense[pid]
+    resid = design.y - (X @ coef + result.intercept)
+    sigma2 = float(np.sum(w * resid**2) / len(resid))
+
+    xtw = X.T.multiply(w).tocsr()                      # X' W, sparse
+    xtwx = (xtw @ X).toarray()                          # X' W X, dense
+    s = np.asarray(xtw.sum(axis=1)).ravel()             # X' w
+    xtwx -= np.outer(s, s) / w.sum()                    # weighted centering
+    xtwx[np.diag_indices(n_cols)] += result.best_lambda
+    return sigma2 * np.diag(np.linalg.inv(xtwx)), sigma2
+
+
+def rapm_standard_errors(
+    design: DesignMatrix, result: RAPMResult
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Posterior standard deviation of every player's offensive and
+    defensive rating: (offense_se, defense_se), pts/100.
+
+    The math (exact, not a heuristic): weighted ridge with penalty lambda
+    is the posterior mode of a Gaussian model with y_i ~ N(x_i b + c,
+    sigma^2 / w_i) and prior b ~ N(mu, (sigma^2 / lambda) I). Its posterior
+    covariance is
+
+        Cov(b) = sigma^2 * (Xc' W Xc + lambda I)^-1
+
+    where Xc is X centered by its weighted column means (the intercept is
+    fit unpenalized, which is what centering accounts for). The prior MEAN
+    mu (zero, or a box-score prior) does not enter, so this serves both
+    `fit_rapm` and `fit_rapm_bayesian`. sigma^2 is estimated from the
+    weighted residuals: mean(w * r^2). Dense inverse of a (2P x 2P) matrix
+    with P ~ 500-800 players -- a fraction of a second.
+
+    NOTE: these are POSTERIOR SDs around SHRUNK estimates. Do not feed
+    (rating, se) to a second model as an unbiased measurement -- that
+    counts the prior twice. Use `likelihood_measurements` for that.
+    """
+    var, _ = _posterior_variance(design, result)
+    off_se: dict[int, float] = {}
+    def_se: dict[int, float] = {}
+    for pid, i in design.player_index.items():
+        off_se[pid] = float(np.sqrt(var[2 * i]))
+        def_se[pid] = float(np.sqrt(var[2 * i + 1]))
+    return off_se, def_se
+
+
+@dataclass(frozen=True)
+class LikelihoodMeasurements:
+    """What the possession DATA alone says about each rating, with the
+    ridge prior divided back out: estimate and standard error per player,
+    per side. Players whose posterior carries (numerically) no information
+    beyond the prior are ABSENT -- they have no measurement, not a zero."""
+
+    offense: dict[int, float]
+    offense_se: dict[int, float]
+    defense: dict[int, float]
+    defense_se: dict[int, float]
+
+
+def likelihood_measurements(
+    design: DesignMatrix, result: RAPMResult, *, min_info_ratio: float = 0.05
+) -> LikelihoodMeasurements:
+    """Divide the ridge prior out of each rating's (marginal) posterior.
+
+    Why: Stage 3 treats each single-season rating as a noisy MEASUREMENT of
+    true talent. A ridge estimate is not one -- it has already been pulled
+    toward its prior (zero, or the box-score prior), and its posterior SD
+    (`rapm_standard_errors`) already includes the prior's information.
+    Feeding (shrunk estimate, posterior SD) to the aging model counts the
+    prior twice and flattens real season-to-season change: on the real
+    2023-26 panel the posterior SDs (~1.2) EXCEEDED the spread of the
+    ratings themselves (~1.05), and the hierarchy concluded talent never
+    changes (sigma_player ~0.05).
+
+    Gaussian division, per coordinate: posterior N(m, v), prior N(mu0,
+    tau^2) with tau^2 = sigma^2 / lambda, so the likelihood is N(l, s^2):
+
+        1/s^2 = 1/v - 1/tau^2
+        l     = s^2 * (m/v - mu0/tau^2)
+
+    Exact when the design is orthogonal (l is then the OLS estimate); with
+    correlated teammates the marginal v already folds in that ambiguity,
+    so s is if anything conservative. A coordinate whose data precision is
+    below `min_info_ratio` of the prior precision has essentially no data
+    behind it and is left out rather than given an enormous, numerically
+    fragile SE.
+    """
+    var, sigma2 = _posterior_variance(design, result)
+    tau2 = sigma2 / result.best_lambda
+    mu0 = result.prior_mean if result.prior_mean is not None else np.zeros(len(var))
+    out: dict[str, dict[int, float]] = {k: {} for k in ("o", "os", "d", "ds")}
+    for pid, i in design.player_index.items():
+        for col, m, ek, sk in ((2 * i, result.offense[pid], "o", "os"),
+                               (2 * i + 1, result.defense[pid], "d", "ds")):
+            data_prec = 1.0 / var[col] - 1.0 / tau2
+            if data_prec <= min_info_ratio / tau2:
+                continue
+            s2 = 1.0 / data_prec
+            out[ek][pid] = float(s2 * (m / var[col] - mu0[col] / tau2))
+            out[sk][pid] = float(np.sqrt(s2))
+    return LikelihoodMeasurements(out["o"], out["os"], out["d"], out["ds"])

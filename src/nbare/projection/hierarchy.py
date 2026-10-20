@@ -73,6 +73,9 @@ class HierarchicalCurveResult:
     obs_a: np.ndarray = field(repr=False)
     obs_y: np.ndarray = field(repr=False)
     obs_w: np.ndarray = field(repr=False)
+    # Known per-observation standard errors, or None if the model learned
+    # a possession-scaled noise term (obs_sigma) instead.
+    obs_se: np.ndarray | None = field(default=None, repr=False)
 
     def player_curve_samples(self, player_id: int) -> np.ndarray:
         """Posterior samples of the player's rating across the whole age
@@ -141,8 +144,11 @@ class HierarchicalCurveResult:
         mu_grid = baseline[:, :, None] + S - S[:, :, [self.ref_idx]]  # (S, N, K)
         mu_obs = mu_grid[:, self.obs_i, self.obs_a]                    # (S, n_obs)
 
-        obs_sigma = self.samples["obs_sigma"][:, None]                 # (S, 1)
-        eff_sd = obs_sigma / np.sqrt(np.clip(self.obs_w, 1e-6, None) / 1000.0)
+        if self.obs_se is not None:
+            eff_sd = np.broadcast_to(self.obs_se[None, :], mu_obs.shape)
+        else:
+            obs_sigma = self.samples["obs_sigma"][:, None]             # (S, 1)
+            eff_sd = obs_sigma / np.sqrt(np.clip(self.obs_w, 1e-6, None) / 1000.0)
 
         rng = np.random.default_rng(seed)
         draws = rng.normal(mu_obs, eff_sd)  # (S, n_obs), one predictive draw per posterior draw
@@ -153,6 +159,43 @@ class HierarchicalCurveResult:
         return float(np.mean(inside))
 
 
+    def holdout_coverage(
+        self,
+        holdout: list[PlayerSeason],
+        rating_attr: str,
+        se_attr: str,
+        prob: float = 0.8,
+        seed: int = 0,
+    ) -> tuple[float, int]:
+        """OUT-OF-SAMPLE calibration: the fraction of held-out observations
+        (seasons NOT in the fit -- e.g. each player's latest season) that
+        land inside their `prob` central predictive interval. Returns
+        (coverage, n_scored).
+
+        This is the check that means something. `posterior_predictive_
+        coverage` scores the data the model was fit to; with ~2.5 seasons
+        and ~2.5 free parameters per player the fit hugs those points, so
+        in-sample coverage runs well above nominal even for a correct
+        model (98.8% at 90% on a correctly-specified synthetic panel).
+        Here the predictive draw is the player's posterior curve at the
+        held-out age plus that observation's own measurement noise
+        N(0, se). Rows for players or ages outside the fit are skipped,
+        not guessed, and counted out of n_scored.
+        """
+        age_pos = {a: k for k, a in enumerate(self.age_grid)}
+        rng = np.random.default_rng(seed)
+        inside = n = 0
+        for r in holdout:
+            if r.player_id not in self.player_index or r.age not in age_pos:
+                continue
+            mu = self.player_curve_samples(r.player_id)[:, age_pos[r.age]]
+            draws = mu + rng.normal(0.0, getattr(r, se_attr), size=mu.shape)
+            lo, hi = np.quantile(draws, [(1 - prob) / 2, 1 - (1 - prob) / 2])
+            inside += lo <= getattr(r, rating_attr) <= hi
+            n += 1
+        return (inside / n if n else float("nan")), n
+
+
 def _build_age_grid(age_min: int, age_max: int, anchor_age: int) -> tuple[list[int], int]:
     age_grid = list(range(age_min, age_max + 1))
     ref_idx = age_grid.index(anchor_age)
@@ -160,13 +203,34 @@ def _build_age_grid(age_min: int, age_max: int, anchor_age: int) -> tuple[list[i
 
 
 def _model(obs_i, obs_a, obs_y, obs_w, ref_idx, position_of_player,
-           n_players, n_positions, n_ages, baseline_prior_mean, baseline_prior_sd):
+           n_players, n_positions, n_ages, baseline_prior_mean, baseline_prior_sd,
+           obs_se=None, smooth_league_curve=False):
     sigma_position = numpyro.sample("sigma_position", dist.HalfNormal(2.0))
     sigma_player = numpyro.sample("sigma_player", dist.HalfNormal(2.0))
-    obs_sigma = numpyro.sample("obs_sigma", dist.HalfNormal(5.0))
+    if obs_se is None:
+        obs_sigma = numpyro.sample("obs_sigma", dist.HalfNormal(5.0))
 
-    with numpyro.plate("age_transition", n_ages - 1):
-        league_delta = numpyro.sample("league_delta", dist.Normal(0.0, 5.0))
+    if smooth_league_curve:
+        # Random-walk (smoothness) prior on the league curve: each age's
+        # delta is the previous age's plus N(0, tau_league), with tau_league
+        # learned. With independent N(0, 5) deltas, an age observed in only
+        # a handful of player-seasons can swing several points on noise
+        # alone -- seen on the real panel as a ~5.6 pts/100 drop between 39
+        # and 40. Smoothing borrows strength from neighboring ages, which
+        # is the only information an aging curve has at its thin edges.
+        # Non-centered for the same funnel reason as below.
+        tau_league = numpyro.sample("tau_league", dist.HalfNormal(0.3))
+        first = numpyro.sample("league_delta_first", dist.Normal(0.0, 1.0))
+        steps = numpyro.sample(
+            "league_delta_steps", dist.Normal(0.0, 1.0).expand([n_ages - 2]).to_event(1)
+        )
+        league_delta = first + jnp.concatenate(
+            [jnp.zeros(1), jnp.cumsum(tau_league * steps)]
+        )
+        numpyro.deterministic("league_delta", league_delta)
+    else:
+        with numpyro.plate("age_transition", n_ages - 1):
+            league_delta = numpyro.sample("league_delta", dist.Normal(0.0, 5.0))
 
     # Non-centered parameterization: sample a raw N(0,1) and scale/shift it,
     # rather than sampling directly from Normal(parent, sigma). A centered
@@ -190,14 +254,27 @@ def _model(obs_i, obs_a, obs_y, obs_w, ref_idx, position_of_player,
     # position_delta has shape (n_positions, n_ages - 1).
 
     with numpyro.plate("player", n_players):
-        baseline = numpyro.sample(
-            "baseline", dist.Normal(baseline_prior_mean, baseline_prior_sd)
-        )
+        if baseline_prior_sd is None:
+            # Learned spread of players' true levels around the baseline
+            # prior mean (the box-score prediction in layer 3): the
+            # trajectory-model analogue of ridge choosing lambda from the
+            # data. A FIXED wide sd (the old 6.0) barely shrinks noisy
+            # single-season measurements, which on real data spread
+            # projections ~2.5x wider than the pooled RAPM leaderboard.
+            sigma_baseline = numpyro.sample("sigma_baseline", dist.HalfNormal(3.0))
+            baseline_raw = numpyro.sample("baseline_raw", dist.Normal(0.0, 1.0))
+            baseline = baseline_prior_mean + sigma_baseline * baseline_raw
+        else:
+            baseline = numpyro.sample(
+                "baseline", dist.Normal(baseline_prior_mean, baseline_prior_sd)
+            )
         player_delta_raw = numpyro.sample(
             "player_delta_raw", dist.Normal(0.0, 1.0).expand([n_ages - 1]).to_event(1)
         )
     player_delta = position_delta[position_of_player] + sigma_player * player_delta_raw
     numpyro.deterministic("player_delta", player_delta)
+    if baseline_prior_sd is None:
+        numpyro.deterministic("baseline", baseline)
 
     cum = jnp.concatenate(
         [jnp.zeros((n_players, 1)), jnp.cumsum(player_delta, axis=1)], axis=1
@@ -205,7 +282,13 @@ def _model(obs_i, obs_a, obs_y, obs_w, ref_idx, position_of_player,
     mu_grid = baseline[:, None] + cum - cum[:, ref_idx][:, None]  # (n_players, n_ages)
     mu_obs = mu_grid[obs_i, obs_a]
 
-    eff_sd = obs_sigma / jnp.sqrt(jnp.clip(obs_w, 1e-6) / 1000.0)
+    # Known measurement error (see `fit_hierarchical_curve`'s `se_attr`):
+    # the likelihood SD is each rating's own standard error, nothing
+    # learned. Otherwise, a learned noise scale shrinking with possessions.
+    if obs_se is not None:
+        eff_sd = obs_se
+    else:
+        eff_sd = obs_sigma / jnp.sqrt(jnp.clip(obs_w, 1e-6) / 1000.0)
     numpyro.sample("obs", dist.Normal(mu_obs, eff_sd), obs=obs_y)
 
 
@@ -218,13 +301,37 @@ def fit_hierarchical_curve(
     age_max: int,
     anchor_age: int,
     baseline_prior_mean: dict[int, float] | None = None,
-    baseline_prior_sd: float = 20.0,
+    baseline_prior_sd: float | None = 20.0,
     num_warmup: int = 400,
     num_samples: int = 400,
     num_chains: int = 2,
     seed: int = 0,
+    se_attr: str | None = None,
+    smooth_league_curve: bool = False,
 ) -> HierarchicalCurveResult:
     """Fit the player -> position -> league partial-pooling model.
+
+    `se_attr` (e.g. "off_se") names a PlayerSeason field holding each
+    rating's KNOWN standard error. With it, observation noise is fixed to
+    those SEs rather than learned. Why that matters: when a player has
+    only 2-3 seasons, "his true level changed" (sigma_player) and "this
+    season's rating is noisy" (obs_sigma) explain the same scatter, and a
+    model that must learn both cannot tell them apart -- on the real
+    2023-26 panel that was a ridge the sampler never converged along
+    (R-hat ~1.2 on both, worsening with longer chains). Fixing the noise
+    at the rating's own posterior SD -- the standard known-error
+    (meta-analysis) setup -- makes sigma_player identifiable. Every
+    observation must then carry an SE; a missing one raises rather than
+    being guessed. Prefer it whenever SEs exist: the learned-noise mode
+    (se_attr=None) is known NOT to converge reliably even on synthetic
+    panels (obs_sigma R-hat 1.08-1.23 across seeds at 4 x 1000 draws in
+    test_projection_baseline's dataset).
+
+    `baseline_prior_sd=None` LEARNS the spread of player levels around
+    `baseline_prior_mean` (site `sigma_baseline`) instead of fixing it;
+    `smooth_league_curve=True` puts a learned random-walk prior on the
+    league curve. Both are off by default (the synthetic-validated layer-2
+    behavior) and on in the real-data pipeline -- see `_model` for why.
 
     `baseline_prior_mean` defaults to 0 for every player (uninformative --
     layer 2's setting). Layer 3 (`baseline.py`) calls this with a box-score
@@ -246,6 +353,13 @@ def fit_hierarchical_curve(
     obs_a = np.array([age_pos[s.age] for s in seasons], dtype=np.int32)
     obs_y = np.array([getattr(s, rating_attr) for s in seasons], dtype=np.float64)
     obs_w = np.array([getattr(s, weight_attr) for s in seasons], dtype=np.float64)
+    if se_attr is not None:
+        se_vals = [getattr(s, se_attr) for s in seasons]
+        if any(v is None or not v > 0 for v in se_vals):
+            raise ValueError(f"se_attr={se_attr!r} set but some observations lack a positive SE")
+        obs_se = np.array(se_vals, dtype=np.float64)
+    else:
+        obs_se = None
     position_of_player = np.array(
         [position_index[player_position[pid]] for pid in players], dtype=np.int32
     )
@@ -274,6 +388,8 @@ def fit_hierarchical_curve(
         n_players=n_players, n_positions=n_positions, n_ages=n_ages,
         baseline_prior_mean=jnp.array(prior_mean_arr),
         baseline_prior_sd=baseline_prior_sd,
+        obs_se=None if obs_se is None else jnp.array(obs_se),
+        smooth_league_curve=smooth_league_curve,
     )
 
     samples = {k: np.asarray(v) for k, v in mcmc.get_samples().items()}
@@ -283,5 +399,5 @@ def fit_hierarchical_curve(
         samples=samples, player_index=player_index, position_index=position_index,
         player_position=player_position, age_grid=age_grid, ref_idx=ref_idx,
         anchor_age=anchor_age, idata=idata,
-        obs_i=obs_i, obs_a=obs_a, obs_y=obs_y, obs_w=obs_w,
+        obs_i=obs_i, obs_a=obs_a, obs_y=obs_y, obs_w=obs_w, obs_se=obs_se,
     )

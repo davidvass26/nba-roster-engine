@@ -92,3 +92,39 @@ recovery test breaks, this ordering tells you which layer broke it.
 `numpyro` + `arviz` (the `[model]` extra). Install first:
 `pip install -e ".[dev,model]"`. Follow all CLAUDE.md principles — exact math,
 honesty over false completeness, synthetic-first validation.
+## Real-data run (v1, 2023-26) — what it took
+
+`nbare ingest-bio` then `nbare export-projections` (~30 min, 4 parallel
+chains). Three findings changed the pipeline from the synthetic-only build;
+each was fixed with a planted-truth test before touching real data again:
+
+1. **Measurement noise must be known, not learned.** With ≤3 seasons per
+   player, learned observation noise and real talent change (sigma_player)
+   explain the same scatter; R-hat ~1.2 on both, worse with longer chains.
+   Fix: each rating carries a known standard error (`se_attr`).
+2. **Shrunk ridge ratings are not measurements.** Feeding (ridge estimate,
+   posterior SD) counts the prior twice and flattened all change
+   (sigma_player ~0.05). Fix: `rapm.fit.likelihood_measurements` divides
+   the prior back out (planted: slope 1.03 vs truth, 93% coverage at 90%).
+3. **Fixed priors set the answer at thin data.** A fixed baseline sd (6)
+   spread projections ~2.5x wider than the leaderboard; independent N(0,5)
+   league deltas swung ~5.6 pts/100 between ages 39 and 40. Fix: learned
+   level spread (`baseline_prior_sd=None`), random-walk smoothing of the
+   league curve, and no projections past the oldest age with ≥15
+   player-seasons (36 on 2023-26).
+
+Validation that ships with the output (`meta.json` → `projections`):
+R-hat gate (export refused above 1.05), and an out-of-sample backtest —
+refit without 2025-26, predict it: the 80% band contained 78.9% (offense)
+and 80.3% (defense) of 370 actual 2025-26 ratings. In-sample predictive
+coverage is NOT used for this: with ~1 parameter per observation it runs
+far above nominal even for a correct model.
+
+Scale note: projections estimate underlying talent with the model's own
+learned pooling, which is much weaker than the ridge leaderboard's, so the
+two are not on the same numeric scale (SGA +12.1 projected vs +7.4 pooled
+ridge). Compare players within the projections, not across.
+
+Known gaps: only three seasons (backfilling more would identify
+player-specific aging far better — sigma_player is currently ~0.09);
+AJ-Green-style single-team confounding passes straight through from RAPM.

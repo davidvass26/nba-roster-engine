@@ -18,7 +18,10 @@ projected wins under the 2023 CBA. It is built in stages:
   features built from cached box scores by `rapm/box_features.py`)
 - **Stage 3** — multi-year player projections (v1 shipped: delta-method aging
   curve + player/position/league partial pooling + box-score baseline,
-  numpyro/arviz; see `docs/stage3_spec.md`. Attrition, availability, and
+  numpyro/arviz; see `docs/stage3_spec.md`. Runs on real data via
+  `nbare export-projections`: per-season RAPM with the ridge prior divided
+  out (`likelihood_measurements`) as known-error measurements, R-hat gate,
+  and a held-out-season backtest. Attrition, availability, and
   box-score-modulated curve shape deferred to v2.)
 - **Stage 4** — MILP roster optimizer (not started)
 - **Stage 5** — agent layer + eval harness (not started)
@@ -73,7 +76,7 @@ flag it rather than working around it.
 
 - **Run the relevant SKILL.md first** if one applies (document/spreadsheet
   creation, etc.). For pure Python module work in `src/`, no skill applies.
-- **Tests must pass before committing.** `make test` (currently 219 tests, incl. doctests).
+- **Tests must pass before committing.** `make test` (currently 250 tests, incl. doctests).
   Commit green so every point in history is a working state.
 - **Add tests with every behavior change.** This repo's credibility is its
   test suite. A change without a test is incomplete.
@@ -138,6 +141,8 @@ src/nbare/
                          (numpyro, non-centered parameterization)
     baseline.py         layer 3: box-score-informed baseline prior, reusing
                          rapm/prior.py's BoxScoreRow/feature sets/regression
+    panel.py            real-data connector: per-season measurements + ages +
+                         positions -> PlayerSeason panel
     project.py          top-level: posterior samples per player per future
                          year, shaped for the Stage 4 optimizer
     synthetic.py        ground-truth player-panel generators for validation
@@ -153,6 +158,9 @@ nbare ingest-contracts data/raw/<csv>      # contract data-quality report
 nbare check-trade <csv> --send X --receive Y   # salary-matching legality
 nbare apply-overrides <csv> <overlay.yaml> --team PHI
 nbare fit-rapm --season 2024-25            # needs a local backfill first
+nbare export-app-data                      # pooled + last-season RAPM -> app/data
+nbare ingest-bio                           # per-season ages + positions (nba.com)
+nbare export-projections                   # Stage 3 on real data -> app/data (~30 min)
 ```
 
 ## Gotchas already fixed (do not reintroduce)
@@ -166,6 +174,14 @@ nbare fit-rapm --season 2024-25            # needs a local backfill first
 - **Grouped CV, not random CV, for RAPM lambda.** Stints from one game share
   lineups/pace; random splits leak and pick too-small lambda. Split on
   `game_id`.
+- **Shrunk estimates are not measurements.** Never feed a ridge rating and
+  its posterior SD to a second model as an unbiased observation — the prior
+  gets counted twice (it flattened every aging curve to sigma_player ~0.05).
+  Use `rapm.fit.likelihood_measurements`, which divides the prior out.
+- **In-sample predictive coverage overstates calibration** when each
+  player has about as many parameters as observations. Judge projection
+  intervals by `holdout_coverage` (held-out season), not
+  `posterior_predictive_coverage`.
 - **Reversed substitution direction** is the classic stint bug. The minutes
   gate (`validate_minutes`) exists to catch it — do not build RAPM on a
   reconstruction that hasn't passed it.
