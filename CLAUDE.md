@@ -76,7 +76,7 @@ flag it rather than working around it.
 
 - **Run the relevant SKILL.md first** if one applies (document/spreadsheet
   creation, etc.). For pure Python module work in `src/`, no skill applies.
-- **Tests must pass before committing.** `make test` (currently 250 tests, incl. doctests).
+- **Tests must pass before committing.** `make test` (currently 226 test functions / 250 collected cases).
   Commit green so every point in history is a working state.
 - **Add tests with every behavior change.** This repo's credibility is its
   test suite. A change without a test is incomplete.
