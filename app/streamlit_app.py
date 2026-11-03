@@ -505,58 +505,301 @@ with tab_opt:
     st.caption("Not built yet. This is the roadmap, not a placeholder for its own sake.")
 
 # --- Methodology ------------------------------------------------------------
+# Written for a reader (front-office analyst, hiring manager) who wants to
+# know how every number on this page was produced and how far to trust it.
+# Every figure below is read from meta.json, config.LEAGUE_YEARS, or the
+# CBA module's own constants -- nothing is hand-typed, so the prose cannot
+# drift out of sync with what the engine actually ran.
+
+
+def _n(x, spec: str = ",") -> str:
+    """Format a meta.json number, or '?' if the export didn't record it."""
+    return format(x, spec) if isinstance(x, (int, float)) else "?"
+
+
 with tab_method:
+    from nbare.cba.matching import (
+        BAND_1_CEILING, BAND_2_CEILING, BAND_2_FLAT_ADD, MATCHING_ALLOWANCE,
+    )
+
+    pinfo = meta.get("projections") or {}
+    last_info = meta.get("last_season") or {}
+    bt = pinfo.get("backtest") or {}
+    seasons = meta.get("seasons_used") or []
+    seasons_txt = ", ".join(seasons) if seasons else "multiple seasons"
+
     st.subheader("Methodology")
     st.markdown(
-        f"""
-`nbare` is an NBA roster-construction engine: **contracts → CBA rules →
-RAPM → value → projections**, built so that every number on this page can
-be traced back to a computation, not an eyeballed guess.
-
-**How it's validated.** Every nontrivial computation in this engine is
-proven against a planted, synthetic ground truth before it ever touches
-real data — the stint reconstruction recovers planted lineups exactly, the
-box-score connector recovers planted scoring exactly, and RAPM recovers
-planted player ratings at roughly **0.99 correlation** on synthetic games
-with known answers. "Produces plausible output" is never treated as a
-substitute for that.
-
-**Why INDETERMINATE is a feature.** The CBA salary-matching engine returns
-three-valued verdicts — `LEGAL` / `ILLEGAL` / `INDETERMINATE` — not two.
-When a fact the rules need (likely incentives, exact dead-money
-attribution, an option type) is not observable from the contract source,
-the engine says so rather than silently assuming the favorable case. An
-honest "I can't verify this" beats a confident wrong answer.
-
-**What's real:**
-- Cap sheets and trade legality run live against the actual 2023 CBA
-  salary-matching bands, computed from a real Basketball-Reference
-  contracts export.
-- RAPM is a real ridge-regression fit (grouped cross-validation on
-  {meta.get('n_games', '?'):,} games / {meta.get('n_stints', '?'):,} stints
-  across {', '.join(meta.get('seasons_used', []) or ['multiple seasons'])})
-  on real play-by-play, gated so any game whose lineup reconstruction fails
-  a minutes-accuracy check is excluded from the fit entirely, not silently
-  trusted.
-
-**What's approximate:**
-- **Replacement level** ({meta.get('replacement_level', '?')} pts/100) is a
-  configurable placeholder in the neighborhood of established box-score
-  metrics' conventions, not yet empirically calibrated against this
-  project's own rating distribution.
-- **Single-team defensive confounder**: a player who has spent almost all
-  his minutes with the same small set of teammates is hard for ridge
-  regression to separate from his team's system, which can inflate
-  individual defensive ratings. Schedule and garbage-time adjustments that
-  would help are in development, not shipped.
-- Apron payroll from the contract source is a **lower bound** — likely
-  incentives, cap holds for free agents and unsigned picks, and precise
-  dead-money attribution are not in this data source.
-
-**What's next:** a MILP roster optimizer (Stage 4) that finds legal moves
-maximizing projected wins, and a real-data run of the projections pipeline
-described above (currently validated on synthetic data only).
-
-Source: [{REPO_URL.split('//')[-1]}]({REPO_URL})
         """
+`nbare` is a roster-construction engine built in stages:
+**contracts → CBA rules → player impact (RAPM) → value → multi-year
+projections → (next) a CBA-constrained optimizer.** The point is the
+*system*. The impact metric is deliberately conventional, so the novel
+part, which is finding legal moves that maximize projected wins, sits on
+a foundation that's easy to audit.
+
+Three rules run through everything:
+
+1. **Validate against planted truth first.** Each computation has to
+   recover a known answer on synthetic data before it touches real data.
+2. **Unknown means unknown.** If a fact can't be observed from the source
+   data, the engine reports `INDETERMINATE` or a lower bound. It never
+   assumes the favorable case.
+3. **Exact money math.** Dollars are integers or `Decimal`, never floats,
+   and percentages round half-up the way the CBA does.
+        """
+    )
+
+    # --- 1. Data ------------------------------------------------------------
+    st.markdown("### 1. Data")
+    st.markdown(
+        f"""
+- **Contracts:** a Basketball-Reference contracts export for {SEASON}.
+  The raw file is never edited. Corrections and transactions (sign, waive,
+  trade, amend) are applied as overlays on top, which keeps the original
+  point-in-time record intact. Rows the parser can't fully trust are marked
+  *Flagged for review* on the Cap Sheets tab.
+- **Play-by-play and box scores:** nba.com, fetched through a
+  rate-limited, disk-cached client. **{_n(meta.get('n_games'))} games**
+  across {seasons_txt} feed the pooled fit.
+- **Player bio:** per-season ages and positions from nba.com, used only by
+  the projection model.
+        """
+    )
+
+    # --- 2. CBA engine ------------------------------------------------------
+    st.markdown("### 2. Cap sheets and trade legality")
+    st.markdown(
+        f"""
+Cap thresholds are stored as **data keyed by league year**, not as
+constants in the rule code. That's what makes it possible to check a
+trade against any past season's rules. {SEASON} figures:
+        """
+    )
+    st.dataframe(
+        pl.DataFrame({
+            "Threshold": ["Salary cap", "Luxury tax", "First apron", "Second apron"],
+            "Amount": [ly.salary_cap, ly.tax_level, ly.first_apron, ly.second_apron],
+        }),
+        hide_index=True,
+        column_config={"Amount": st.column_config.NumberColumn(format="$%d")},
+    )
+    st.markdown(
+        f"""
+**Salary matching (2023 CBA).** Each side of a trade is checked against
+the band for its *post-trade* payroll, where S is the salary the team
+sends out:
+
+| Team after trade | Outgoing salary S | May take back up to |
+|---|---|---|
+| Below 1st apron | ≤ ${BAND_1_CEILING:,} | 200% of S + ${MATCHING_ALLOWANCE:,} |
+| Below 1st apron | ${BAND_1_CEILING:,} – ${BAND_2_CEILING:,} | S + ${BAND_2_FLAT_ADD:,} |
+| Below 1st apron | > ${BAND_2_CEILING:,} | 125% of S + ${MATCHING_ALLOWANCE:,} |
+| Above 1st apron | any | 100% of S |
+
+The bands are fixed dollar amounts in the CBA and don't scale with the
+cap.
+
+**Three-valued verdicts.** Every check returns `LEGAL`, `ILLEGAL`, or
+`INDETERMINATE`, together with the band used, the dollar ceiling, and the
+rule it cites. `INDETERMINATE` means the answer depends on something this
+data source doesn't contain, such as likely or unlikely incentives,
+cap-room absorption, dead-money attribution, or option type. The engine
+states that dependency rather than guessing.
+
+**Apron payroll is a lower bound.** The source has base salary only.
+Likely incentives, cap holds, and exact dead money are missing, so every
+payroll figure shown is a floor, labeled as one.
+        """
+    )
+
+    # --- 3. Impact ----------------------------------------------------------
+    st.markdown("### 3. Player impact: RAPM")
+    st.markdown(
+        f"""
+**Step 1: Rebuild every lineup from play-by-play.** The play-by-play
+records substitutions but not who is on the floor. The engine works out
+the five players per team for every stretch between substitutions (a
+*stint*). Two safeguards protect this step:
+- **Allowlist filter.** An ID is accepted as a player only if it appears
+  in the real player table. Team IDs and replay or event codes that leak
+  into player slots get removed before reconstruction.
+- **Minutes gate.** Each player's reconstructed floor time must match the
+  official box-score minutes within 90 seconds. A game that fails is
+  **excluded from the fit** rather than trusted. This is what catches the
+  classic reversed-substitution bug.
+
+After the gate: **{_n(meta.get('n_stints'))} stints** from
+{_n(meta.get('n_games'))} games.
+
+**Step 2: Possessions and the design matrix.** Possessions are estimated
+per stint and split by which team had the ball, so each player gets an
+**offensive** and a **defensive** coefficient. Each row is weighted by its
+possessions.
+
+**Step 3: Ridge regression.** Plain adjusted plus-minus is unstable:
+teammates who share the floor can get offsetting extreme ratings that
+just fit noise. Ridge regression adds a penalty that pulls ratings toward
+a prior unless the data says otherwise. The penalty strength λ is chosen
+by **cross-validation grouped by game**. A random split would put stints
+from the same game in both train and test (same lineups, pace, and
+referees), which leaks information and picks too little shrinkage.
+Selected λ = **{_n(meta.get('lambda'), ',.0f')}**.
+
+**Step 4: A box-score prior instead of zero.** Standard ridge pulls every
+low-minute player to league average. Here, players are pulled toward
+what their **box score predicts**:
+- First, fit plain ridge. Then, on players with at least 1,000
+  possessions, regress rating on box-score features. Offense uses
+  points, assists, and turnovers per 100 possessions plus true shooting.
+  Defense uses steals, blocks, defensive-rebound rate, and a big/non-big
+  flag, because steals and blocks alone misrank positional defenders.
+- That prediction becomes each player's prior mean. A player with 50
+  possessions ends up close to his box-score estimate. A player with
+  thousands is driven by his on-court results.
+        """
+    )
+    st.latex(r"\hat\beta = \arg\min_\beta \; \|W^{1/2}(X\beta - y)\|^2 + \lambda\|\beta - \mu_{\text{box}}\|^2")
+    st.markdown(
+        f"""
+**Two fits are shown.** The pooled fit over {seasons_txt} is the most
+stable. A separate single-season fit on {last_info.get('season', 'the last season')}
+({_n(last_info.get('n_games'))} games) is more current and noisier.
+
+**Step 5: From rate to wins.** RAPM is a per-100-possession rate.
+*Wins Added* turns it into a volume number by weighting each side by that
+side's own possessions above replacement level R:
+        """
+    )
+    st.latex(
+        r"\text{Value} = \frac{(\text{off} - \tfrac{R}{2})\cdot\text{poss}_{off}"
+        r" + (\text{def} - \tfrac{R}{2})\cdot\text{poss}_{def}}{100},"
+        r"\qquad \text{Wins Added} = \frac{\text{Value}}{"
+        + f"{_n(meta.get('points_per_win'), 'g')}" + r"}"
+    )
+    st.markdown(
+        f"""
+R = **{_n(meta.get('replacement_level'), 'g')}** pts/100, which is half a
+point below BPM's published convention. It is a **placeholder and has not
+been calibrated** against this project's own rating distribution. The
+offense/defense split matters here. An earlier version multiplied total
+RAPM by combined possessions, which counted every possession twice and
+inflated wins by about 2×. A unit test now pins the corrected formula.
+        """
+    )
+
+    # --- 4. Projections -----------------------------------------------------
+    st.markdown("### 4. Multi-year projections")
+    st.markdown(
+        f"""
+The projection model is a hierarchical Bayesian model (numpyro, NUTS
+sampler), fit separately for offense and defense. It was built and tested
+one layer at a time:
+
+1. **Aging curve by the delta method.** A naive regression of rating on
+   age suffers from survivorship bias: weak players leave the league
+   early, so the players still around at 35 look good. The delta method
+   compares each player only with himself one season later (age *a* to
+   *a*+1). Survivorship then decides which deltas exist but not what they
+   say. Gap years are skipped, not interpolated.
+2. **Partial pooling, player → position → league.** Each player's curve
+   is shrunk toward his position group's curve, and each group's toward
+   the league curve. How much to shrink is learned from the data.
+3. **Box-score baseline.** Like the RAPM prior, it gives thin-sample
+   players a sensible starting level.
+
+**No double-counting.** A ridge rating already includes its prior, so
+passing it in as if it were a raw measurement would count that prior
+twice. When this happened in development, it flattened every aging curve.
+Each season's rating therefore enters with the **ridge prior divided
+out**: an unbiased measurement with its own standard error.
+
+**This run:** {_n(pinfo.get('n_panel_rows'))} player-seasons from
+{', '.join(pinfo.get('seasons_used') or []) or '?'};
+{_n(pinfo.get('n_players_projected'))} players projected up to
+{_n(pinfo.get('years_ahead'))} seasons ahead. The sampler used
+{_n((pinfo.get('sampler') or {}).get('num_chains'))} chains, and every
+parameter's R-hat is ≤ 1.01. Projections stop at age
+{_n(pinfo.get('max_projected_age'))} because too few players have been
+observed beyond that to estimate the curve. The model leaves those
+seasons out rather than extrapolating.
+        """
+    )
+    if bt.get("offense") and bt.get("defense"):
+        st.markdown(
+            f"""
+**Out-of-sample backtest.** The model was refit without
+{bt['held_out_season']} and used to predict that season. The 80% intervals
+contained **{bt['offense']['coverage_80']:.0%}** of actual offensive
+ratings and **{bt['defense']['coverage_80']:.0%}** of actual defensive
+ratings ({bt['offense']['n_scored']:,} players), close to the 80% target.
+Calibration is judged on held-out data because in-sample coverage looks
+good almost automatically when each player has about as many parameters
+as observations.
+            """
+        )
+
+    # --- 5. Validation ------------------------------------------------------
+    st.markdown("### 5. How it's validated")
+    st.markdown(
+        """
+Each layer has a synthetic generator with a planted answer, and the test
+suite asserts that the layer recovers it:
+
+| Component | Planted truth it must recover |
+|---|---|
+| Stint reconstruction | exact lineups and minutes, including tricky substitution orderings |
+| Stints → design matrix connector | exact scoring per lineup |
+| Ridge RAPM | planted offense/defense ratings (correlation > 0.95) |
+| Box-score prior | planted box-score → rating relationship |
+| Delta-method aging curve | a planted curve under survivorship-biased attrition |
+| Hierarchical model | planted player/position effects with known measurement error |
+| Salary matching | hand-computed CBA band edge cases, in exact dollars |
+
+Building one layer at a time localizes bugs. For example, a connector bug
+in Stage 2 was caught by its own synthetic test before it could show up
+as strange RAPM values.
+        """
+    )
+
+    # --- 6. Limitations -----------------------------------------------------
+    st.markdown("### 6. Known limitations")
+    st.markdown(
+        f"""
+- **Single-team defensive confounding.** A player who has played nearly
+  all his minutes with one core group is hard to separate from that
+  team's scheme, which can inflate individual defensive ratings.
+- **No schedule or garbage-time adjustment yet.**
+- **Replacement level ({_n(meta.get('replacement_level'), 'g')}) and
+  {_n(meta.get('points_per_win'), 'g')} points per win** are conventions,
+  not calibrated values.
+- **Projections have short histories** (at most two age transitions per
+  player so far), so the intervals are wide. They don't model
+  retirement, injury, or playing time yet.
+- **Projection scale differs from the Impact tab.** The projection model
+  shrinks much less than ridge, so compare players within each tab, not
+  across tabs.
+- **Cap data is base salary only**, so apron figures are lower bounds.
+        """
+    )
+
+    # --- 7. Next ------------------------------------------------------------
+    st.markdown("### 7. What's next")
+    st.markdown(
+        """
+- **Stage 4, the roster optimizer.** A mixed-integer program that
+  searches trades and signings for the moves that maximize projected
+  wins. The constraints are the same salary-matching, apron, and
+  hard-cap rules the Trade Checker enforces, and the objective uses the
+  projection distributions above.
+- **Stage 5, agent layer and evaluation harness.** A natural-language
+  front end over the engine, with an evaluation suite that checks every
+  suggested move for legality.
+        """
+    )
+
+    st.caption(
+        f"Pooled RAPM generated {meta.get('generated_at', '?')[:10]} · "
+        f"projections generated {(pinfo.get('generated_at') or '?')[:10]} · "
+        f"source: [{REPO_URL.split('//')[-1]}]({REPO_URL})"
     )

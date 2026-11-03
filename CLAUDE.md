@@ -76,7 +76,7 @@ flag it rather than working around it.
 
 - **Run the relevant SKILL.md first** if one applies (document/spreadsheet
   creation, etc.). For pure Python module work in `src/`, no skill applies.
-- **Tests must pass before committing.** `make test` (currently 226 test functions / 250 collected cases).
+- **Tests must pass before committing.** `make test` (currently 233 test functions / 257 collected cases).
   Commit green so every point in history is a working state.
 - **Add tests with every behavior change.** This repo's credibility is its
   test suite. A change without a test is incomplete.
@@ -134,6 +134,7 @@ src/nbare/
     synthetic.py       ground-truth game generators for validation
     prior.py           box-score-informed prior mean for Bayesian RAPM
     box_features.py    cached box scores -> BoxScoreRow features for the prior
+    prior_gap.py       where the box prior and RAPM disagree (gap, posterior z)
   projection/
     types.py           PlayerSeason: the shared per-layer input record
     delta.py           layer 1: delta-method aging curve (survivorship-safe)
@@ -161,6 +162,7 @@ nbare fit-rapm --season 2024-25            # needs a local backfill first
 nbare export-app-data                      # pooled + last-season RAPM -> app/data
 nbare ingest-bio                           # per-season ages + positions (nba.com)
 nbare export-projections                   # Stage 3 on real data -> app/data (~30 min)
+python scripts/prior_vs_rapm.py            # biggest box prior vs RAPM gaps, both directions
 ```
 
 ## Gotchas already fixed (do not reintroduce)
